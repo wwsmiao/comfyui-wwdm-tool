@@ -1,0 +1,80 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadAudio",
+      "pos": [-400, 0],
+      "size": [300, 110],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "AUDIO", "type": "AUDIO", "links": [1], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "LoadAudio" },
+      "widgets_values": ["audio/example.mp3"]
+    },
+    {
+      "id": 2,
+      "type": "WWDMAudioCrop",
+      "pos": [0, 0],
+      "size": [360, 400],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        { "name": "audio", "type": "AUDIO", "link": 1 }
+      ],
+      "outputs": [
+        { "name": "audio", "type": "AUDIO", "links": [2], "slot_index": 0 },
+        { "name": "start", "type": "FLOAT", "links": null, "slot_index": 1 },
+        { "name": "end", "type": "FLOAT", "links": null, "slot_index": 2 },
+        { "name": "duration", "type": "FLOAT", "links": null, "slot_index": 3 },
+        { "name": "preview", "type": "IMAGE", "links": null, "slot_index": 4 }
+      ],
+      "properties": { "Node name for S&R": "WWDMAudioCrop" },
+      "widgets_values": [10, 90, 0, 0, 0]
+    },
+    {
+      "id": 3,
+      "type": "SaveAudioAdvanced",
+      "pos": [420, 0],
+      "size": [300, 130],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        { "name": "audio", "type": "AUDIO", "link": 2 }
+      ],
+      "outputs": [],
+      "properties": { "Node name for S&R": "SaveAudioAdvanced" },
+      "widgets_values": ["audio/wwdm_cropped", { "format": "flac" }]
+    },
+    {
+      "id": 4,
+      "type": "PreviewAudio",
+      "pos": [420, 200],
+      "size": [300, 100],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        { "name": "audio", "type": "AUDIO", "link": 2 }
+      ],
+      "outputs": [],
+      "properties": { "Node name for S&R": "PreviewAudio" }
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "AUDIO"],
+    [2, 2, 0, 3, 0, "AUDIO"],
+    [3, 2, 0, 4, 0, "AUDIO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
