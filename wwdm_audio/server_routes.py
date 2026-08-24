@@ -1,102 +1,190 @@
 """
-服务端路由：为前端提供波形数据接口
+WWDMAudioCrop 服务端路由（v2）
 
-POST /wwdm/audio/waveform
-    body: {"audio_id": "<前端生成的唯一ID>", "width": 1200}
-    -> 前端 JS 在把音频传给节点前，先将音频临时文件上传到 input 目录，
-       再把文件路径（base64）作为参数传给本接口，服务端解码后渲染波形 PNG 返回。
+提供：
+    POST /wwdm/audio/analyze   上传音频文件 → 返回 {peaks, sample_rate, duration, max, audio_url}
+                                波形数据（1200 桶峰值）+ 可直接播放的 /view URL，
+                                供前端在节点未执行/无波形消息时也能即时加载波形并播放。
+    POST /wwdm/audio/waveform  上传音频 → 返回波形 PNG（可选，保留）
+    GET  /wwdm/audio/ping      健康检查
 """
 
-import base64
 import io
+import logging
+import os
+import re
 
 import numpy as np
-import torch
 from PIL import Image
 
-from .audio_crop import render_waveform_image
+from .audio_crop import (
+    build_view_url,
+    compute_peaks,
+    load_audio_file,
+    render_waveform_image,
+    save_wav,
+)
+
+log = logging.getLogger("wwdm.audio")
 
 try:
-    import server
+    from server import PromptServer
 
-    _routes = server.PromptServer.instance.routes
-except Exception:
+    _routes = PromptServer.instance.routes
+    _has_server = True
+except Exception as _server_import_err:
+    log.debug("PromptServer 不可用（%s），路由将在 ComfyUI 环境中注册", _server_import_err)
     _routes = None
+    _has_server = False
+
+try:
+    import aiohttp
+    from aiohttp import web
+except Exception:
+    aiohttp = None
+    web = None
 
 
-def _decode_audio_payload(payload):
-    """从请求体解析出 waveform 与 sample_rate"""
-    # 支持的格式1: {"waveform_b64": ..., "sample_rate": ...} （波形 f32 原始字节）
-    if isinstance(payload, dict):
-        if payload.get("waveform_b64"):
-            raw = base64.b64decode(payload["waveform_b64"])
-            sr = int(payload.get("sample_rate", 44100))
-            arr = np.frombuffer(raw, dtype=np.float32)
-            # 尝试按声道数还原：先按单声道展平，由前端附带 shape
-            shape = payload.get("shape")
-            if shape:
-                arr = arr.reshape([int(x) for x in shape])
-            else:
-                # 无 shape 信息时按 (1, 1, N) 处理
-                arr = arr.reshape(1, 1, -1)
-            return torch.from_numpy(arr), sr
-        # 支持的格式2: 直接传 {"waveform": [...], "sample_rate": ...}
-        if payload.get("waveform") is not None:
-            wf = np.asarray(payload["waveform"], dtype=np.float32)
-            sr = int(payload.get("sample_rate", 44100))
-            if wf.ndim == 1:
-                wf = wf[None, None, :]
-            return torch.from_numpy(wf), sr
-    return None, None
+# ---------------------------------------------------------------- 工具
+async def _decode_request_bytes(request):
+    """从 multipart 或 raw body 读取音频字节"""
+    try:
+        reader = request.multipart()
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            data = await part.read()
+            if data and len(data) > 44:  # 跳过空部分/极小分片
+                return part.name or "", data
+        return "", None
+    except Exception:
+        pass
+    try:
+        data = await request.read()
+        return "", data or None
+    except Exception:
+        return "", None
 
 
+def _sanitize_filename(name):
+    name = os.path.basename(str(name or "audio"))
+    name = re.sub(r"[^A-Za-z0-9._\u4e00-\u9fff-]", "_", name)
+    return name or "audio.wav"
+
+
+def _safe_json(data, status=200):
+    return web.json_response(data, status=status)
+
+
+# ---------------------------------------------------------------- 路由
 def _register_routes():
-    if _routes is None:
+    if _routes is None or web is None:
         return
+
+    @_routes.post("/wwdm/audio/analyze")
+    async def wwdm_audio_analyze(request):
+        filename, data = await _decode_request_bytes(request)
+        if not data:
+            return _safe_json({"error": "未收到音频数据"}, 400)
+
+        # 保存为临时文件再解码（PyAV 需要文件路径）
+        tmp = None
+        try:
+            import tempfile
+
+            ext = os.path.splitext(_sanitize_filename(filename))[1] or ".mp3"
+            fd, tmp = tempfile.mkstemp(suffix=ext)
+            os.close(fd)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            waveform, sr = load_audio_file(tmp)
+        except Exception as exc:
+            log.warning("analyze 解码失败: %s", exc)
+            return _safe_json({"error": f"音频解码失败: {exc}"}, 422)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+        # 计算峰值（1200 桶，供前端渲染）
+        mono = waveform.mean(dim=0).float().cpu().numpy()
+        peaks = compute_peaks(mono, 1200).tolist()
+        duration = waveform.shape[1] / float(sr)
+        maxv = float(np.max(np.abs(mono))) if mono.size else 0.0
+
+        # 保存为 wav（前端可直接播放 + 后续裁剪保存用）
+        import random
+        import time
+
+        try:
+            out_dir = os.path.join(os.environ.get("COMFYUI_OUTPUT_DIR", ""), "wwdm_audio_crop") or None
+            if not out_dir:
+                import folder_paths
+
+                out_dir = os.path.join(folder_paths.get_output_directory(), "wwdm_audio_crop")
+            os.makedirs(out_dir, exist_ok=True)
+            fn = f"audio_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.wav"
+            path = os.path.join(out_dir, fn)
+            save_wav(waveform.unsqueeze(0), sr, path)
+            audio_url = build_view_url("wwdm_audio_crop/" + fn, type_="output")
+        except Exception as exc:
+            log.warning("analyze 保存 wav 失败: %s", exc)
+            audio_url = None
+
+        return _safe_json(
+            {
+                "ok": True,
+                "peaks": peaks,
+                "sample_rate": sr,
+                "duration": duration,
+                "max": maxv,
+                "audio_url": audio_url,
+                "filename": filename or None,
+            }
+        )
 
     @_routes.post("/wwdm/audio/waveform")
     async def wwdm_audio_waveform(request):
+        filename, data = await _decode_request_bytes(request)
+        if not data:
+            return _safe_json({"error": "未收到音频数据"}, 400)
+
+        import tempfile
+
+        tmp = None
         try:
-            payload = await request.json()
-        except Exception:
-            payload = None
+            ext = os.path.splitext(_sanitize_filename(filename))[1] or ".mp3"
+            fd, tmp = tempfile.mkstemp(suffix=ext)
+            os.close(fd)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            waveform, sr = load_audio_file(tmp)
+        except Exception as exc:
+            return _safe_json({"error": f"音频解码失败: {exc}"}, 422)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
-        waveform, sample_rate = _decode_audio_payload(payload)
-        if waveform is None:
-            import aiohttp
-            from aiohttp import web
-            return web.json_response({"error": "invalid payload"}, status=400)
-
-        width = int(payload.get("width", 1200)) if isinstance(payload, dict) else 1200
-        width = max(200, min(width, 2400))
-        height = int(payload.get("height", 240)) if isinstance(payload, dict) else 240
-        height = max(80, min(height, 800))
-
-        arr = render_waveform_image(waveform, sample_rate, width=width, height=height)
+        arr = render_waveform_image(waveform.unsqueeze(0), sr, width=1200, height=240)
         if arr is None:
-            import aiohttp
-            from aiohttp import web
-            return web.json_response({"error": "render failed"}, status=500)
-
-        img = Image.fromarray((arr * 255).astype(np.uint8), mode="RGBA")
+            return _safe_json({"error": "波形渲染失败"}, 500)
+        img = Image.fromarray((arr * 255).astype(np.uint8), mode="RGB")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        png = buf.getvalue()
+        return web.Response(body=buf.getvalue(), content_type="image/png")
 
-        import aiohttp
-        from aiohttp import web
-        return web.Response(body=png, content_type="image/png")
-
-    # 健康检查
     @_routes.get("/wwdm/audio/ping")
     async def wwdm_audio_ping(request):
-        import aiohttp
-        from aiohttp import web
-        return web.json_response({"ok": True, "plugin": "Comfyui-wwdm-tool"})
+        return _safe_json({"ok": True, "plugin": "Comfyui-wwdm-tool", "v": 2})
 
 
 try:
     _register_routes()
-except Exception as e:
-    import logging
-    logging.getLogger("wwdm.audio").warning("WWDMAudioCrop 自定义路由注册失败（不影响节点功能）: %s", e)
+except Exception as exc:
+    log.warning("WWDMAudioCrop 路由注册失败（不影响节点功能）: %s", exc)
