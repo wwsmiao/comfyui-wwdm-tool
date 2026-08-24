@@ -19,6 +19,9 @@ import { $el } from "../../../scripts/ui.js";
 
 const NODE_TYPE = "WWDMAudioCrop";
 
+// 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
+const WWDM_VERSION = "v3.0.0";
+
 function normalizeUrl(url) {
   if (!url) return url;
   if (/^https?:\/\//.test(url)) return url;
@@ -331,6 +334,12 @@ class WaveCanvas {
     // 背景
     ctx.fillStyle = "#0e1420";
     ctx.fillRect(0, 0, w, h);
+
+    // 版本标记（左上角，便于确认加载的是否最新版）
+    ctx.fillStyle = "rgba(120, 160, 220, 0.55)";
+    ctx.font = "9px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("wwdm " + WWDM_VERSION, 4, h - 5);
 
     if (!this.hasData) {
       ctx.fillStyle = "#55607a";
