@@ -28,6 +28,7 @@ UI 消息（executed 时返回给前端）：
 
 import os
 import random
+import re
 import time
 
 import numpy as np
@@ -39,6 +40,31 @@ try:
     import av
 except Exception:
     av = None
+
+
+# =====================================================================
+# 时间解析（mm:ss 格式）
+# =====================================================================
+def _parse_time(v, default=0.0):
+    """解析 mm:ss / mm:ss.xxx / 纯秒 → float 秒；无效返回 default"""
+    if v is None:
+        return default
+    s = str(v).strip()
+    if not s:
+        return default
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return float(s)
+    m = re.fullmatch(r"(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?", s)
+    if m:
+        sec = int(m.group(2))
+        if sec >= 60:
+            return default
+        frac = float("0." + m.group(3)) if m.group(3) else 0.0
+        return int(m.group(1)) * 60 + sec + frac
+    try:
+        return float(s)
+    except Exception:
+        return default
 
 
 # =====================================================================
@@ -191,21 +217,12 @@ class WWDMAudioCrop:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # 开始时间（秒）
-                "start_time": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
-                ),
-                # 结束时间（秒，0 = 音频末尾）
-                "end_time": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
-                ),
-                # 选取时长（秒，>0 时 end = start + duration，结束手柄自动跳转）
-                "duration": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
-                ),
+                # 开始时间（mm:ss 或秒）
+                "start_time": ("STRING", {"default": "00:00", "multiline": False}),
+                # 结束时间（mm:ss 或秒，"00:00" = 音频末尾）
+                "end_time": ("STRING", {"default": "00:00", "multiline": False}),
+                # 选取时长（mm:ss 或秒，>0 时 end = start + duration）
+                "duration": ("STRING", {"default": "00:00", "multiline": False}),
             },
             "optional": {
                 # 兼容旧工作流：外部 AUDIO 输入（与 audio_file 二选一，优先 audio_file）
@@ -232,7 +249,7 @@ class WWDMAudioCrop:
         except Exception:
             return float("nan")
 
-    def crop(self, start_time=0.0, end_time=0.0, duration=0.0, audio=None, audio_file=""):
+    def crop(self, start_time="00:00", end_time="00:00", duration="00:00", audio=None, audio_file=""):
         # ---- 音频来源：优先节点内上传的文件，其次外部 AUDIO 输入 ----
         waveform = None
         sample_rate = None
@@ -253,15 +270,19 @@ class WWDMAudioCrop:
         if total_samples == 0:
             raise ValueError("WWDMAudioCrop: 输入音频长度为 0")
 
-        # ---- 统一换算为秒（全部按采样点计算，无浮点误差）----
-        s = float(start_time) if start_time and start_time > 0 else 0.0
-        s = max(0.0, min(s, total_sec))
+        # ---- 解析时间参数（mm:ss 或秒）----
+        start_v = _parse_time(start_time)
+        end_v = _parse_time(end_time)
+        dur_v = _parse_time(duration)
 
-        if duration and duration > 0:
+        # ---- 统一换算为秒（全部按采样点计算，无浮点误差）----
+        s = max(0.0, min(start_v, total_sec))
+
+        if dur_v and dur_v > 0:
             # 时长联动：结束 = 开始 + 时长
-            e = s + float(duration)
-        elif end_time and end_time > 0:
-            e = float(end_time)
+            e = s + dur_v
+        elif end_v and end_v > 0:
+            e = end_v
         else:
             # 未指定 → 末尾
             e = total_sec

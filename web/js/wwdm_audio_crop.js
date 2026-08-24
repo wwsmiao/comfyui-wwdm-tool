@@ -1,16 +1,13 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v5）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v6）
  *
- * v5 修复与优化（基于用户实测反馈）：
- *   1. 可复用已上传音频：上传区下方增加"已上传音频"下拉框（列出 input 目录音频），可切换
- *   2. 修复手柄拖动：改用 Pointer Events（setPointerCapture 对 pointerId 有效），
- *      扩大手柄命中区；黄/红手柄可自由拖动，选区内按住左键可整体拖动选区
- *   3. 时间格式 mm:ss：开始/结束/时长输入框支持 "mm:ss"（或 "mm:ss.xxx" / 纯秒），
- *      任意一处修改 → 另一处 + 波形手柄同步更新
- *   4. 修复播放：从开始手柄位置起播到结束手柄位置自动停止（可试听截取内容）；
- *      播放中按钮变"⏹ 停止"，再次点击可停止
+ * v6 优化（基于用户实测反馈）：
+ *   1. 节点框高度自适应：覆盖 computeSize，确保上传区/下拉框/画布/输入行/按钮全部可见
+ *   2. 新增「🔄 同步」按钮：手动输入修改后一键同步开始/结束/时长 + 波形手柄
+ *   3. 节点参数 start_time/end_time/duration 改为 mm:ss 字符串（与后端一致）
+ *   4. 去掉虚线播放指针：播放固定从开始手柄位置到结束手柄位置，界面更简洁
  *
- * 架构（沿用 v4，参考 Goohai 参考音频功能）：
+ * 架构（沿用 v4/v5）：
  *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码画波形 → <audio> 播放
  */
 import { app } from "../../../scripts/app.js";
@@ -20,7 +17,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v5.0.0";
+const WWDM_VERSION = "v6.0.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -56,11 +53,6 @@ function fmtMMSS(t) {
   if (ssf && ssf !== "00") return `${pad(m)}:${pad(ssi)}.${ssf}`;
   return `${pad(m)}:${pad(ssi)}`;
 }
-/** 时长标签用（秒） */
-function fmtTime(t) {
-  if (!isFinite(t) || t < 0) return "0.00";
-  return t.toFixed(2);
-}
 
 function makeFileUrl(name) {
   if (!name) return "";
@@ -72,8 +64,7 @@ function makeFileUrl(name) {
 }
 
 // =====================================================================
-// WaveCanvas —— 波形画布（双手柄 + 播放头 + 缩放平移）
-// 使用 Pointer Events 实现稳定拖动
+// WaveCanvas —— 波形画布（双手柄 + 缩放平移）
 // =====================================================================
 class WaveCanvas {
   constructor(canvas, opts = {}) {
@@ -89,7 +80,6 @@ class WaveCanvas {
     this.viewEnd = 0;
     this.selStart = 0;
     this.selEnd = 0;
-    this.playhead = -1;
 
     this.dragging = null; // 'left' | 'right' | 'sel' | 'view'
     this.dragStartX = 0;
@@ -143,11 +133,6 @@ class WaveCanvas {
     const end = Math.min(this.selStart + Math.max(0, d), dur);
     this.setSelection(this.selStart, end, silent);
   }
-  setPlayhead(t) {
-    this.playhead = t;
-    this.render();
-    if (this.opts.onPlayhead) this.opts.onPlayhead();
-  }
 
   // ---------------------------------------------------------- 视图
   fitAll() {
@@ -199,7 +184,7 @@ class WaveCanvas {
   }
 
   // ---------------------------------------------------------- 播放
-  /** 从 from 播放到 to（起点用开始手柄位置，终点用结束手柄位置） */
+  /** 从 from 播放到 to（固定：起点=开始手柄，终点=结束手柄） */
   playRange(from, to, url) {
     if (!url || !this.hasData) return;
     this.stop();
@@ -209,7 +194,6 @@ class WaveCanvas {
     this.audioEndTime = Math.max(from, Math.min(to, this.duration));
     this.playing = true;
 
-    // 等待元数据加载完成后再设置起点并播放（否则 currentTime 设置无效）
     const startPlay = () => {
       try {
         audio.currentTime = Math.max(0, Math.min(from, this.duration));
@@ -228,14 +212,10 @@ class WaveCanvas {
       }, { once: true });
     }
   }
-  /** 播放选区：始终从开始手柄位置起播（若播放头在选区内则从播放头起播） */
+  /** 播放选区：固定从开始手柄位置起播 */
   playSelection(url) {
     if (!url || !this.hasData) return;
-    let from = this.selStart;
-    if (this.playhead >= this.selStart && this.playhead <= this.selEnd) {
-      from = this.playhead;
-    }
-    this.playRange(from, this.selEnd, url);
+    this.playRange(this.selStart, this.selEnd, url);
     if (this.opts.onPlayState) this.opts.onPlayState(true);
   }
   stop() {
@@ -255,11 +235,9 @@ class WaveCanvas {
   _playLoop() {
     if (!this.audio || !this.playing) return;
     if (this.audio.currentTime >= this.audioEndTime) {
-      this.setPlayhead(this.audioEndTime);
       this.stop();
       return;
     }
-    this.setPlayhead(this.audio.currentTime);
     this.playRaf = requestAnimationFrame(() => this._playLoop());
   }
 
@@ -301,8 +279,7 @@ class WaveCanvas {
         this.dragging = "sel";
         this.dragStartSel = { s: this.selStart, e: this.selEnd };
       } else {
-        // 空白处 → 设置播放头，并开始平移视图
-        this.setPlayhead(Math.max(0, Math.min(t, this.duration)));
+        // 空白处 → 平移视图（不再设置播放头）
         this.dragging = "view";
         this.dragStartX = e.clientX;
         this.dragStartView = this.viewStart;
@@ -444,7 +421,7 @@ class WaveCanvas {
     ctx.lineTo(w, center);
     ctx.stroke();
 
-    // 时间刻度（按跨度自适应）
+    // 时间刻度
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.font = "10px monospace";
     ctx.textAlign = "left";
@@ -460,19 +437,6 @@ class WaveCanvas {
       ctx.lineTo(x, h);
       ctx.stroke();
       ctx.fillText(fmtMMSS(t), x + 2, 12);
-    }
-
-    // 播放头
-    if (this.playhead >= 0) {
-      const px = this._timeToX(this.playhead);
-      ctx.strokeStyle = "rgba(255,170,60,0.9)";
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.moveTo(px, 0);
-      ctx.lineTo(px, h);
-      ctx.stroke();
-      ctx.setLineDash([]);
     }
 
     this._drawHandle(sx, "#ffd54a");
@@ -703,7 +667,7 @@ app.registerExtension({
         mkInput("选取时长", "wwdmInpDur")
       );
 
-      // ---------- 按钮行 ----------
+      // ---------- 按钮行（播放 + 同步） ----------
       const btnStyle = (bg) => ({
         background: bg,
         color: "#fff",
@@ -716,12 +680,14 @@ app.registerExtension({
       });
       this.wwdmBtnPlay = $el("button", { textContent: "▶ 播放", style: btnStyle("#2e7d54") });
       this.wwdmBtnPlay.style.flex = "1";
+      // 同步按钮：手动输入修改后一键同步所有相关部分
+      this.wwdmBtnSync = $el("button", { textContent: "🔄 同步", style: btnStyle("#3d5a80") });
       const hint = $el("div", {
         style: { fontSize: "10px", color: "#5c6a82", flex: "2", lineHeight: "16px", textAlign: "right" },
-        textContent: "滚轮缩放 · 空白拖动平移 · 单击设播放头 · 双击适配",
+        textContent: "滚轮缩放 · 空白拖动平移 · 双击适配",
       });
       const btnRow = $el("div", { style: { display: "flex", gap: "8px", marginTop: "6px", alignItems: "center" } });
-      btnRow.append(this.wwdmBtnPlay, hint);
+      btnRow.append(this.wwdmBtnPlay, this.wwdmBtnSync, hint);
 
       const wrap = $el("div", { style: { width: "100%", padding: "2px 0" } });
       wrap.append(uploadZone, fileRow, this.wwdmFileName, this.wwdmCanvas, inputRow, btnRow);
@@ -729,35 +695,53 @@ app.registerExtension({
 
       if (this.addDOMWidget) {
         this.wwdmWidget = this.addDOMWidget("wwdm_ui", "wwdm_ui", wrap, { serialize: false });
+        this.wwdmWidget.computeSize = function (width) {
+          // 内容高度自适应：上传区 + 下拉 + 文件名 + 画布 + 输入行 + 按钮行 + 边距
+          return [width || 320, 290];
+        };
       } else {
         const container = this.el || this.nodeEl || this.constructor?.nodeEl;
         if (container) container.appendChild(wrap);
       }
 
+      // 节点高度覆盖（确保所有 UI 可见，含播放/同步按钮）
+      const origComputeSize = this.computeSize?.bind(this);
+      this.computeSize = function (w) {
+        const base = origComputeSize ? origComputeSize(w) : [360, 400];
+        const needed = 400; // 上传区(38) + 下拉(30) + 文件名(20) + 画布(156) + 输入行(52) + 按钮行(36) + widgets(~60) + 边距
+        return [base[0], Math.max(base[1], needed)];
+      };
+
       // ---------- 输入框事件（mm:ss，双向同步） ----------
       this._wwdmGuard = false;
-      this.wwdmInpStart.addEventListener("input", () => {
-        if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseTime(this.wwdmInpStart.value);
-        if (v == null) return;
-        const dur = this.wwdmWc.duration;
-        const s = Math.min(v, dur);
-        const e = Math.max(s + 0.01, this.wwdmWc.selEnd);
-        this.wwdmWc.setSelection(s, e);
-      });
-      this.wwdmInpEnd.addEventListener("input", () => {
-        if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseTime(this.wwdmInpEnd.value);
-        if (v == null) return;
-        const e = Math.min(v, this.wwdmWc.duration);
-        const s = Math.min(e - 0.01, this.wwdmWc.selStart);
-        this.wwdmWc.setSelection(s, e);
-      });
-      this.wwdmInpDur.addEventListener("input", () => {
-        if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseTime(this.wwdmInpDur.value);
-        if (v == null) return;
-        this.wwdmWc.setDuration(v);
+      // 从输入框读取三个时间值（无效值忽略）
+      this._wwdmReadInputs = () => {
+        const sv = parseTime(this.wwdmInpStart.value);
+        const ev = parseTime(this.wwdmInpEnd.value);
+        const dv = parseTime(this.wwdmInpDur.value);
+        return { sv, ev, dv };
+      };
+      // 手动输入修改：仅更新输入框显示（不立即改手柄，等待同步按钮或回车）
+      this.wwdmInpStart.addEventListener("change", () => this._wwdmApplyInputs("start"));
+      this.wwdmInpEnd.addEventListener("change", () => this._wwdmApplyInputs("end"));
+      this.wwdmInpDur.addEventListener("change", () => this._wwdmApplyInputs("dur"));
+      // 回车键也触发
+      for (const inp of [this.wwdmInpStart, this.wwdmInpEnd, this.wwdmInpDur]) {
+        inp.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            const which = inp === this.wwdmInpStart ? "start" : inp === this.wwdmInpEnd ? "end" : "dur";
+            this._wwdmApplyInputs(which);
+          }
+        });
+      }
+
+      // ---------- 同步按钮 ----------
+      this.wwdmBtnSync.addEventListener("click", () => {
+        if (!this.wwdmWc.hasData) {
+          alert("请先上传或选择音频文件");
+          return;
+        }
+        this._wwdmSyncAll();
       });
 
       // ---------- 播放按钮 ----------
@@ -841,7 +825,6 @@ app.registerExtension({
           const files = data.files || [];
           const sel = this.wwdmFileSelect;
           const cur = this._wwdmCurrentName;
-          // 重建选项
           sel.innerHTML = "";
           if (!files.length) {
             sel.style.display = "none";
@@ -877,6 +860,50 @@ app.registerExtension({
       return r;
     };
 
+    // ---------- 应用输入框修改（同步输入框 → 波形 + 节点参数） ----------
+    nodeType.prototype._wwdmApplyInputs = function (which) {
+      if (!this.wwdmWc?.hasData) return;
+      const { sv, ev, dv } = this._wwdmReadInputs();
+      const dur = this.wwdmWc.duration;
+      const sel = this.wwdmWc.selection;
+      let s = sel.start, e = sel.end;
+
+      if (which === "start") {
+        if (sv == null) { this._wwdmSyncWidgets(); return; }
+        s = Math.min(Math.max(0, sv), dur);
+        if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
+      } else if (which === "end") {
+        if (ev == null) { this._wwdmSyncWidgets(); return; }
+        e = Math.min(Math.max(s + 0.01, ev), dur);
+      } else if (which === "dur") {
+        if (dv != null && dv > 0) {
+          e = Math.min(dur, s + dv);
+        }
+      }
+      this.wwdmWc.setSelection(s, e);
+      this._wwdmSyncWidgets();
+    };
+
+    // ---------- 一键同步全部（输入框 + 节点参数 + 手柄） ----------
+    nodeType.prototype._wwdmSyncAll = function () {
+      if (!this.wwdmWc?.hasData) return;
+      const { sv, ev, dv } = this._wwdmReadInputs();
+      const dur = this.wwdmWc.duration;
+      const cur = this.wwdmWc.selection;
+      let s = cur.start, e = cur.end;
+
+      // 优先级：开始 → 时长 → 结束（时长优先于结束）
+      if (sv != null) s = Math.min(Math.max(0, sv), dur);
+      if (dv != null && dv > 0) {
+        e = Math.min(dur, s + dv);
+      } else if (ev != null && ev > 0) {
+        e = Math.min(Math.max(s + 0.01, ev), dur);
+      }
+      if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
+      this.wwdmWc.setSelection(s, e);
+      this._wwdmSyncWidgets();
+    };
+
     // ---------- 选区 → 节点参数 + 输入框 同步 ----------
     nodeType.prototype._wwdmSyncWidgets = function () {
       if (this._wwdmGuard) return;
@@ -886,9 +913,9 @@ app.registerExtension({
         const dur = end - start;
         const w = (name) => this.widgets?.find((x) => x.name === name);
         const ws = w("start_time"), we = w("end_time"), wd = w("duration");
-        if (ws) ws.value = start;
-        if (we) we.value = end;
-        if (wd) wd.value = dur;
+        if (ws) ws.value = fmtMMSS(start);
+        if (we) we.value = fmtMMSS(end);
+        if (wd) wd.value = fmtMMSS(dur);
         if (this.wwdmInpStart) this.wwdmInpStart.value = fmtMMSS(start);
         if (this.wwdmInpEnd) this.wwdmInpEnd.value = fmtMMSS(end);
         if (this.wwdmInpDur) this.wwdmInpDur.value = fmtMMSS(dur);
@@ -903,20 +930,20 @@ app.registerExtension({
       const r = onWidgetChanged?.apply(this, arguments);
       if (this._wwdmGuard || !this.wwdmWc?.hasData) return r;
       if (widget?.name === "start_time") {
-        const v = parseFloat(value);
-        if (isFinite(v) && v >= 0) {
+        const v = parseTime(value);
+        if (v != null) {
           const e = Math.max(v + 0.01, this.wwdmWc.selEnd);
           this.wwdmWc.setSelection(v, e);
         }
       } else if (widget?.name === "end_time") {
-        const v = parseFloat(value);
-        if (isFinite(v) && v >= 0) {
+        const v = parseTime(value);
+        if (v != null) {
           const s = Math.min(v - 0.01, this.wwdmWc.selStart);
           this.wwdmWc.setSelection(s, v);
         }
       } else if (widget?.name === "duration") {
-        const v = parseFloat(value);
-        if (isFinite(v) && v >= 0) this.wwdmWc.setDuration(v);
+        const v = parseTime(value);
+        if (v != null) this.wwdmWc.setDuration(v);
       }
       return r;
     };
