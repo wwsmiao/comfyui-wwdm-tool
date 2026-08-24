@@ -1,14 +1,14 @@
 """
-WWDMAudioCrop 节点 —— 音频可视化裁剪（v3，重新设计）
+WWDMAudioCrop 节点 —— 音频可视化裁剪（v4，节点内上传）
 
-功能（与剪辑软件一致的交互）：
-    节点面板内嵌完整波形剪辑界面：
-      - 波形画布：开始手柄 / 结束手柄（可拖动）
-      - 播放按钮：从选区开始播放，到选区结束自动停止
-      - 时间输入：开始时间 / 结束时间 / 选取时长（手动输入）
-      - 时长联动：设置选取时长后，结束手柄自动跳转到 开始+时长 位置
+功能（参考 Goohai-MiniMax-H3 插件的参考音频功能设计）：
+    - 节点面板内直接上传音频（点击 / 拖拽），无需连接 AUDIO 输入
+    - 前端用 Web Audio 纯前端解码并绘制波形（上传即见波形，不依赖执行）
+    - 剪辑式交互：开始/结束手柄、播放按钮、时间输入、时长联动
 
-输入参数（去掉了百分比 slider）：
+输入参数：
+    audio      - 可选 AUDIO 输入（兼容旧工作流；与 audio_file 二选一，优先 audio_file）
+    audio_file - 节点内上传的音频文件名（input 目录，含 subfolder），隐藏 widget
     start_time - 开始时间（秒）
     end_time   - 结束时间（秒，0 = 音频末尾）
     duration   - 选取时长（秒，>0 时强制 end = start + duration）
@@ -191,7 +191,6 @@ class WWDMAudioCrop:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "audio": ("AUDIO",),
                 # 开始时间（秒）
                 "start_time": (
                     "FLOAT",
@@ -208,7 +207,12 @@ class WWDMAudioCrop:
                     {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
                 ),
             },
-            "optional": {},
+            "optional": {
+                # 兼容旧工作流：外部 AUDIO 输入（与 audio_file 二选一，优先 audio_file）
+                "audio": ("AUDIO",),
+                # 节点内上传的音频文件名（input 目录，含 subfolder；前端隐藏 widget）
+                "audio_file": ("STRING", {"default": "", "multiline": False}),
+            },
         }
 
     RETURN_TYPES = ("AUDIO", "FLOAT", "FLOAT", "FLOAT", "IMAGE")
@@ -218,19 +222,31 @@ class WWDMAudioCrop:
     DESCRIPTION = "可视化截取波形音频：开始/结束手柄 + 播放 + 手动输入时间 + 时长联动"
 
     @classmethod
-    def IS_CHANGED(cls, audio, **kwargs):
+    def IS_CHANGED(cls, audio=None, audio_file="", **kwargs):
         try:
-            wf = audio["waveform"]
-            return float(wf.shape[-1]), int(wf.dtype == torch.float16)
+            key = str(audio_file or "")
+            if audio is not None:
+                wf = audio["waveform"]
+                key += f"#{float(wf.shape[-1])}#{int(wf.dtype == torch.float16)}"
+            return key
         except Exception:
             return float("nan")
 
-    def crop(self, audio, start_time, end_time, duration):
-        if audio is None:
-            raise ValueError("WWDMAudioCrop: 输入 audio 为空，请先连接音频")
+    def crop(self, start_time=0.0, end_time=0.0, duration=0.0, audio=None, audio_file=""):
+        # ---- 音频来源：优先节点内上传的文件，其次外部 AUDIO 输入 ----
+        waveform = None
+        sample_rate = None
+        if audio_file and str(audio_file).strip():
+            path = folder_paths.get_annotated_filepath(str(audio_file).strip())
+            wav2d, sample_rate = load_audio_file(path)
+            waveform = wav2d.unsqueeze(0)  # [C,L] -> [1,C,L]
+        elif audio is not None:
+            waveform = audio["waveform"]
+            sample_rate = int(audio["sample_rate"])
+        else:
+            raise ValueError("WWDMAudioCrop: 请在节点内上传音频文件，或连接 AUDIO 输入")
 
-        waveform = audio["waveform"]
-        sample_rate = int(audio["sample_rate"])
+        sample_rate = int(sample_rate)
         total_samples = waveform.shape[-1]
         total_sec = total_samples / float(sample_rate) if sample_rate > 0 else 0.0
 
