@@ -36,7 +36,7 @@
         { "name": "preview", "type": "IMAGE", "links": null, "slot_index": 4 }
       ],
       "properties": { "Node name for S&R": "WWDMAudioCrop" },
-      "widgets_values": [10, 90, 0, 0, 0]
+      "widgets_values": [0, 10, 0]
     },
     {
       "id": 3,

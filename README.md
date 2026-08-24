@@ -8,30 +8,25 @@ WWDM 工具集（ComfyUI 自定义节点插件）
 
 ### 🎵 WWDMAudioCrop — 音频可视化裁剪节点
 
-对输入的 `AUDIO` 音频进行**可视化裁剪**，支持三种交互方式：
+对输入的 `AUDIO` 音频进行**可视化截取**，交互方式与专业音频剪辑软件一致：
 
-| 方式 | 操作 | 说明 |
-|------|------|------|
-| **1. 进度条** | 拖动 `slider_start` / `slider_end` 两个百分比滑块 | 0~100% 选择保留区间，节点画布内同步显示波形选区与游标 |
-| **2. 起止时间** | 直接填写 `start_time` / `end_time`（秒） | 精确到 0.01s |
-| **3. 开始+秒数** | 填写 `start_time` + `duration`（秒） | 自动从开始时间往后裁剪指定秒数 |
-
-三种方式**可自由组合**，优先级规则：
-
-- 填了 `start_time`（>0）→ 以它为准；否则用 `slider_start` 百分比换算
-- 填了 `end_time`（>0）→ 以它为准；否则用 `slider_end` 百分比换算
-- 填了 `duration`（>0）→ 强制覆盖区间长度（`end = start + duration`）
+- 🟢 **波形画布**：节点面板内直接显示完整音频波形
+- 🟡 **开始手柄**（黄）/ 🔴 **结束手柄**（红）：直接拖动选择裁剪区间
+- ▶ **播放按钮**：从选区播放，到选区结束自动停止，播放时显示橙色进度游标
+- ⏱ **时间输入行**：开始时间 / 结束时间 / 选取时长（手动输入，精确到 0.01s）
+- ⚡ **时长联动**：设置选取时长后，结束手柄自动跳转到「开始时间 + 时长」的位置
+- 🔍 **缩放平移**：滚轮缩放、空白处拖动平移、双击适配选区
 
 #### 输入
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `audio` | AUDIO | 输入音频（兼容 ComfyUI 原生 `Load Audio` / VHS 视频音频输出） |
-| `slider_start` | FLOAT (0-100, slider) | 进度条起始百分比 |
-| `slider_end` | FLOAT (0-100, slider) | 进度条结束百分比 |
-| `start_time` | FLOAT (秒) | 开始时间 |
-| `end_time` | FLOAT (秒) | 结束时间 |
-| `duration` | FLOAT (秒) | 裁剪时长（方式三） |
+| `start_time` | FLOAT (秒) | 开始时间（0 = 从头开始） |
+| `end_time` | FLOAT (秒) | 结束时间（0 = 音频末尾） |
+| `duration` | FLOAT (秒) | 选取时长（>0 时强制 `end = start + duration`） |
+
+> 波形上的手柄拖动、时间输入框、节点参数三者**实时双向同步**，任何方式修改都会联动其他两者。
 
 #### 输出
 
@@ -41,27 +36,19 @@ WWDM 工具集（ComfyUI 自定义节点插件）
 | `start` | FLOAT | 实际开始时间（秒） |
 | `end` | FLOAT | 实际结束时间（秒） |
 | `duration` | FLOAT | 实际裁剪时长（秒） |
-| `preview` | IMAGE | 原始音频波形预览图（RGBA） |
-
-#### 前端可视化
-
-节点面板内自带**波形画布**：
-
-- 🟢 绿色波形 = 音频振幅（峰值）
-- 🟩 半透明绿色区域 = 当前选区（保留部分）
-- 🟡 黄色游标 = 开始 / 结束位置，可**直接拖拽**
-- 波形上**拖拽** = 平移选区；**两端游标** = 调整边界
-- 拖动/输入任意方式，画布实时同步
+| `preview` | IMAGE | 原始音频波形预览图（RGB） |
 
 #### 使用示例
 
 ```
 Load Audio → WWDMAudioCrop → Save Audio (Advanced)
-              │  ├ slider_start: 20
-              │  ├ slider_end: 80      （方式1：保留中间 60%）
+              │  ├ start_time: 2.0
+              │  ├ end_time: 5.0        （或 duration: 3.0 自动联动）
               │  └ ...
               └→ Preview Audio
 ```
+
+也可以在节点面板里直接拖动波形上的黄色/红色手柄来选择区间，播放试听满意后执行即可。
 
 ## 安装
 
@@ -83,8 +70,8 @@ Comfyui-wwdm-tool/
 ├── wwdm_audio/
 │   ├── __init__.py          # 音频工具包
 │   ├── audio_crop.py        # WWDMAudioCrop 节点 + 波形渲染
-│   └── server_routes.py     # 波形数据 API 路由（/wwdm/audio/waveform）
+│   └── server_routes.py     # 服务端路由（/wwdm/audio/analyze、waveform、ping）
 └── web/
     └── js/
-        └── wwdm_audio_crop.js  # 前端波形可视化 + 拖拽交互
+        └── wwdm_audio_crop.js  # 前端波形画布 + 双手柄 + 播放 + 时间输入交互
 ```

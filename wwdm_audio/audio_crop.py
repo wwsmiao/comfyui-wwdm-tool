@@ -1,21 +1,17 @@
 """
-WWDMAudioCrop 节点 —— 音频可视化裁剪（v2）
+WWDMAudioCrop 节点 —— 音频可视化裁剪（v3，重新设计）
 
-功能：
-    对输入的 audio 音频进行可视化裁剪，支持三种方式：
-      1. 进度条（百分比）方式：slider_start / slider_end 以百分比形式拖动选择范围
-      2. 直接输入起止时间（秒）：start_time / end_time
-      3. 选择开始时间 + 裁剪秒数：start_time + duration
+功能（与剪辑软件一致的交互）：
+    节点面板内嵌完整波形剪辑界面：
+      - 波形画布：开始手柄 / 结束手柄（可拖动）
+      - 播放按钮：从选区开始播放，到选区结束自动停止
+      - 时间输入：开始时间 / 结束时间 / 选取时长（手动输入）
+      - 时长联动：设置选取时长后，结束手柄自动跳转到 开始+时长 位置
 
-    前端交互（v2）：
-      - 节点面板：即时波形显示 + 播放按钮（播放选区）+ 裁剪按钮（打开弹窗）
-      - 裁剪弹窗「音频截取」：全波形 + 每5秒时间刻度 + 起止/时长输入 +
-        播放按钮 + 滚轮缩放 / 中键平移 / 点击选区播放 / 拖动选区
-
-    优先级规则（统一按采样点计算，无浮点误差）：
-      - 填了 start_time(>0) 优先于 slider_start
-      - 填了 end_time(>0) 优先于 slider_end
-      - 填了 duration(>0) 强制覆盖区间长度（end = start + duration）
+输入参数（去掉了百分比 slider）：
+    start_time - 开始时间（秒）
+    end_time   - 结束时间（秒，0 = 音频末尾）
+    duration   - 选取时长（秒，>0 时强制 end = start + duration）
 
 输出：
     audio    - 裁剪后的音频（AUDIO）
@@ -23,7 +19,11 @@ WWDMAudioCrop 节点 —— 音频可视化裁剪（v2）
     end      - 实际裁剪结束时间（秒）
     duration - 实际裁剪时长（秒）
     preview  - 原始音频波形预览图（IMAGE，RGB）
-    附加 UI 消息：{wwdm_crop_url, wwdm_crop_duration}（裁剪结果可播放 URL）
+
+UI 消息（executed 时返回给前端）：
+    wwdm_waveform  - {peaks, sample_rate, duration, max} 全音频波形峰值
+    wwdm_audio_url - 全音频 wav 播放 URL（前端播放用，可从任意位置起播）
+    wwdm_crop_url  - 裁剪结果 wav URL
 """
 
 import os
@@ -39,14 +39,6 @@ try:
     import av
 except Exception:
     av = None
-
-try:
-    from comfy_api.latest import ComfyExtension, IO
-    from typing_extensions import override
-
-    _HAS_NEW_API = True
-except Exception:
-    _HAS_NEW_API = False
 
 
 # =====================================================================
@@ -193,32 +185,24 @@ def _waveform_to_thumbnail_bytes(waveform, sample_rate, width=900, height=220):
 # 节点定义
 # =====================================================================
 class WWDMAudioCrop:
-    """音频可视化裁剪节点"""
+    """音频可视化裁剪节点（剪辑式交互：双手柄 + 播放 + 时间输入）"""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "audio": ("AUDIO",),
-                # 方式一：进度条（百分比 0-100），拖动选择区间
-                "slider_start": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "display": "slider"},
-                ),
-                "slider_end": (
-                    "FLOAT",
-                    {"default": 100.0, "min": 0.0, "max": 100.0, "step": 0.1, "display": "slider"},
-                ),
-                # 方式二：直接输入开始/结束时间（秒）
+                # 开始时间（秒）
                 "start_time": (
                     "FLOAT",
                     {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
                 ),
+                # 结束时间（秒，0 = 音频末尾）
                 "end_time": (
                     "FLOAT",
                     {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
                 ),
-                # 方式三：开始时间 + 裁剪秒数
+                # 选取时长（秒，>0 时 end = start + duration，结束手柄自动跳转）
                 "duration": (
                     "FLOAT",
                     {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01},
@@ -231,7 +215,7 @@ class WWDMAudioCrop:
     RETURN_NAMES = ("audio", "start", "end", "duration", "preview")
     FUNCTION = "crop"
     CATEGORY = "wwdm-tool/audio"
-    DESCRIPTION = "对音频进行可视化裁剪：支持进度条百分比、直接输入起止时间、开始时间+秒数三种方式"
+    DESCRIPTION = "可视化截取波形音频：开始/结束手柄 + 播放 + 手动输入时间 + 时长联动"
 
     @classmethod
     def IS_CHANGED(cls, audio, **kwargs):
@@ -241,7 +225,7 @@ class WWDMAudioCrop:
         except Exception:
             return float("nan")
 
-    def crop(self, audio, slider_start, slider_end, start_time, end_time, duration):
+    def crop(self, audio, start_time, end_time, duration):
         if audio is None:
             raise ValueError("WWDMAudioCrop: 输入 audio 为空，请先连接音频")
 
@@ -253,24 +237,21 @@ class WWDMAudioCrop:
         if total_samples == 0:
             raise ValueError("WWDMAudioCrop: 输入音频长度为 0")
 
-        # ---- 统一换算为秒 ----
-        if start_time and start_time > 0:
-            s = float(start_time)
-        else:
-            s = total_sec * (float(slider_start) / 100.0)
+        # ---- 统一换算为秒（全部按采样点计算，无浮点误差）----
+        s = float(start_time) if start_time and start_time > 0 else 0.0
         s = max(0.0, min(s, total_sec))
 
-        if end_time and end_time > 0:
+        if duration and duration > 0:
+            # 时长联动：结束 = 开始 + 时长
+            e = s + float(duration)
+        elif end_time and end_time > 0:
             e = float(end_time)
         else:
-            e = total_sec * (float(slider_end) / 100.0)
-
-        if duration and duration > 0:
-            e = s + float(duration)
-
+            # 未指定 → 末尾
+            e = total_sec
         e = max(s, min(e, total_sec))
 
-        if s >= e and not (s == e == 0.0):
+        if s >= e:
             raise ValueError(
                 f"WWDMAudioCrop: 裁剪区间无效 (start={s:.3f}s >= end={e:.3f}s)，"
                 f"音频总时长 {total_sec:.3f}s"
@@ -278,13 +259,8 @@ class WWDMAudioCrop:
 
         # ---- 采样点裁剪 ----
         start_frame = min(total_samples, int(round(s * sample_rate)))
-        if end_time and end_time > 0:
-            end_frame = min(total_samples, int(round(e * sample_rate)))
-        elif duration and duration > 0:
-            end_frame = min(total_samples, start_frame + int(round(float(duration) * sample_rate)))
-        else:
-            end_frame = min(total_samples, int(round(e * sample_rate)))
-        end_frame = max(start_frame, end_frame)
+        end_frame = min(total_samples, int(round(e * sample_rate)))
+        end_frame = max(start_frame + 1, end_frame)
         if start_frame >= end_frame:
             raise ValueError("WWDMAudioCrop: 裁剪后音频长度为 0，请检查裁剪区间")
 
@@ -302,21 +278,32 @@ class WWDMAudioCrop:
         except Exception:
             preview = None
 
-        # ---- 保存裁剪结果为 wav（供前端播放）----
+        out_dir = os.path.join(folder_paths.get_output_directory(), "wwdm_audio_crop")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # ---- 保存全音频 wav（前端播放用）----
+        audio_url = None
+        try:
+            fn = f"full_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.wav"
+            save_wav(waveform, sample_rate, os.path.join(out_dir, fn))
+            audio_url = build_view_url("wwdm_audio_crop/" + fn, type_="output")
+        except Exception as exc:
+            import logging
+
+            logging.getLogger("wwdm.audio").warning("全音频保存失败（不影响输出）: %s", exc)
+
+        # ---- 保存裁剪结果 wav ----
         crop_url = None
         try:
-            out_dir = os.path.join(folder_paths.get_output_directory(), "wwdm_audio_crop")
-            os.makedirs(out_dir, exist_ok=True)
-            fn = f"audio_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.wav"
-            path = os.path.join(out_dir, fn)
-            save_wav(cropped["waveform"], sample_rate, path)
+            fn = f"crop_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.wav"
+            save_wav(cropped["waveform"], sample_rate, os.path.join(out_dir, fn))
             crop_url = build_view_url("wwdm_audio_crop/" + fn, type_="output")
         except Exception as exc:
             import logging
 
             logging.getLogger("wwdm.audio").warning("裁剪结果保存失败（不影响输出）: %s", exc)
 
-        # ---- 构造 UI 消息（波形数据 + 播放 URL）----
+        # ---- 构造 UI 消息（全音频波形 + 播放 URL + 裁剪 URL）----
         ui = {}
         try:
             wf3 = waveform
@@ -331,9 +318,10 @@ class WWDMAudioCrop:
                 "duration": total_sec,
                 "max": maxv,
             }
+            if audio_url:
+                ui["wwdm_audio_url"] = audio_url
             if crop_url:
                 ui["wwdm_crop_url"] = crop_url
-                ui["wwdm_crop_duration"] = e - s
         except Exception as exc:
             import logging
 
@@ -341,17 +329,3 @@ class WWDMAudioCrop:
 
         # 元组最后一项携带 {'ui': ...}，执行引擎会提取为 executed 消息的 output 字段
         return (cropped, s, e, e - s, preview, {"ui": ui})
-
-
-# =====================================================================
-# 可选：新式 ComfyExtension 注册（若环境支持）
-# =====================================================================
-if _HAS_NEW_API:
-
-    class WWDMAudioCropExt(ComfyExtension):
-        @override
-        async def get_node_list(self):
-            return [WWDMAudioCrop]
-
-    async def comfy_entrypoint():
-        return WWDMAudioCropExt()
