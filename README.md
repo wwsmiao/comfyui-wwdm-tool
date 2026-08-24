@@ -1,5 +1,7 @@
 # Comfyui-wwdm-tool
 
+> 📦 仓库: https://github.com/wwsmiao/comfyui-wwdm-tool
+
 WWDM 工具集（ComfyUI 自定义节点插件）
 
 ## 当前包含
