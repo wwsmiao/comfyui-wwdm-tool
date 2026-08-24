@@ -181,7 +181,35 @@ def _register_routes():
 
     @_routes.get("/wwdm/audio/ping")
     async def wwdm_audio_ping(request):
-        return _safe_json({"ok": True, "plugin": "Comfyui-wwdm-tool", "v": 2})
+        return _safe_json({"ok": True, "plugin": "Comfyui-wwdm-tool", "v": 4})
+
+    @_routes.get("/wwdm/audio/files")
+    async def wwdm_audio_files(request):
+        """列出 input 目录已有的音频文件（根目录 + 一层子目录），供前端下拉切换"""
+        try:
+            import folder_paths
+
+            inp = folder_paths.get_input_directory()
+        except Exception:
+            return _safe_json({"files": []})
+        exts = {
+            ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".mp4",
+            ".wma", ".aiff", ".aif", ".opus", ".webm", ".wmv", ".mov", ".m4b", ".amr", ".ape", ".dsf", ".dff", ".wv", ".tta", ".tak", ".mpc", ".ape", ".flv", ".mkv", ".m4v", ".3gp", ".3g2", ".mts", ".m2ts", ".ts", ".mxf", ".avi", ".w64", ".caf", ".au", ".snd", ".oga", ".spx", ".wma", ".aiff", ".aif", ".aifc", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".webm", ".mp3"
+        }
+        files = []
+        try:
+            for root, dirs, fnames in os.walk(inp):
+                depth = root[len(inp):].count(os.sep)
+                if depth >= 1:
+                    dirs[:] = []  # 只列根目录 + 一层子目录
+                for fn in sorted(fnames):
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        rel = os.path.relpath(os.path.join(root, fn), inp).replace("\\", "/")
+                        files.append(rel)
+        except Exception as exc:
+            log.warning("列出音频文件失败: %s", exc)
+        files.sort(key=str.lower)
+        return _safe_json({"files": files})
 
 
 try:

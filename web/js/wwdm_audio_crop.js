@@ -1,17 +1,17 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v4，节点内上传）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v5）
  *
- * 设计参考 Goohai-MiniMax-H3_Integration 插件的参考音频功能：
- *   - 节点面板内直接上传音频（点击 / 拖拽），无需连接 AUDIO 输入
- *   - 上传后立即用 Web Audio 纯前端解码并绘制波形（不依赖执行）
- *   - 播放用 <audio> 直接播放 input 目录文件（可任意位置起播）
- *   - 剪辑式交互：开始/结束手柄、播放按钮、时间输入、时长联动
+ * v5 修复与优化（基于用户实测反馈）：
+ *   1. 可复用已上传音频：上传区下方增加"已上传音频"下拉框（列出 input 目录音频），可切换
+ *   2. 修复手柄拖动：改用 Pointer Events（setPointerCapture 对 pointerId 有效），
+ *      扩大手柄命中区；黄/红手柄可自由拖动，选区内按住左键可整体拖动选区
+ *   3. 时间格式 mm:ss：开始/结束/时长输入框支持 "mm:ss"（或 "mm:ss.xxx" / 纯秒），
+ *      任意一处修改 → 另一处 + 波形手柄同步更新
+ *   4. 修复播放：从开始手柄位置起播到结束手柄位置自动停止（可试听截取内容）；
+ *      播放中按钮变"⏹ 停止"，再次点击可停止
  *
- * 数据流：
- *   上传 → /upload/image 保存到 input → 文件名存 hidden widget audio_file
- *        → fetch(/view?type=input) → decodeAudioData → 前端计算峰值 → 画波形
- *   执行 → 后端读 input 文件裁剪 → 返回 AUDIO + UI 消息（波形/URL）
- *   兼容：连接了外部 AUDIO 输入时，执行后 onExecuted 也会载入波形
+ * 架构（沿用 v4，参考 Goohai 参考音频功能）：
+ *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码画波形 → <audio> 播放
  */
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
@@ -20,22 +20,48 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v4.0.0";
+const WWDM_VERSION = "v5.0.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
   if (/^https?:\/\//.test(url)) return url;
   return api.apiURL(url.replace(/^\/+/, ""));
 }
+
+// ---------- 时间格式工具（mm:ss 支持）----------
+/** 解析 "mm:ss" / "mm:ss.xxx" / "ss.xxx" / 纯数字秒 → 秒数；解析失败返回 null */
+function parseTime(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return parseFloat(s); // 纯秒
+  const m = s.match(/^(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?$/);
+  if (m) {
+    const sec = parseInt(m[2], 10);
+    if (sec >= 60) return null;
+    const frac = m[3] ? parseFloat("0." + m[3]) : 0;
+    return parseInt(m[1], 10) * 60 + sec + frac;
+  }
+  const f = parseFloat(s);
+  return isFinite(f) && f >= 0 ? f : null;
+}
+/** 秒 → "mm:ss"（含小数保留 2 位） */
+function fmtMMSS(t) {
+  if (!isFinite(t) || t < 0) t = 0;
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  const ss = s.toFixed(2);
+  const [ssi, ssf] = ss.split(".");
+  const pad = (n) => String(n).padStart(2, "0");
+  if (ssf && ssf !== "00") return `${pad(m)}:${pad(ssi)}.${ssf}`;
+  return `${pad(m)}:${pad(ssi)}`;
+}
+/** 时长标签用（秒） */
 function fmtTime(t) {
   if (!isFinite(t) || t < 0) return "0.00";
   return t.toFixed(2);
 }
-function fmtDuration(d) {
-  const s = Math.max(0, Number(d) || 0);
-  const m = Math.floor(s / 60);
-  return String(m).padStart(2, "0") + ":" + (s - m * 60).toFixed(3).padStart(6, "0");
-}
+
 function makeFileUrl(name) {
   if (!name) return "";
   const parts = String(name).replaceAll("\\", "/").split("/").filter(Boolean);
@@ -47,6 +73,7 @@ function makeFileUrl(name) {
 
 // =====================================================================
 // WaveCanvas —— 波形画布（双手柄 + 播放头 + 缩放平移）
+// 使用 Pointer Events 实现稳定拖动
 // =====================================================================
 class WaveCanvas {
   constructor(canvas, opts = {}) {
@@ -64,18 +91,21 @@ class WaveCanvas {
     this.selEnd = 0;
     this.playhead = -1;
 
-    this.dragging = null;
+    this.dragging = null; // 'left' | 'right' | 'sel' | 'view'
     this.dragStartX = 0;
     this.dragStartView = 0;
     this.dragStartSel = null;
+    this.pointerId = null;
 
     this.audio = null;
     this.playing = false;
     this.playRaf = null;
+    this.audioUrl = null;
 
     this._bound = {
       move: (e) => this._onMove(e),
       up: (e) => this._onUp(e),
+      cancel: (e) => this._onUp(e),
     };
     this._bind();
   }
@@ -169,16 +199,36 @@ class WaveCanvas {
   }
 
   // ---------------------------------------------------------- 播放
+  /** 从 from 播放到 to（起点用开始手柄位置，终点用结束手柄位置） */
   playRange(from, to, url) {
     if (!url || !this.hasData) return;
     this.stop();
-    this.audio = new Audio(url);
-    this.audio.currentTime = Math.max(0, Math.min(from, this.duration));
+    this.audioUrl = url;
+    const audio = new Audio(url);
+    this.audio = audio;
     this.audioEndTime = Math.max(from, Math.min(to, this.duration));
     this.playing = true;
-    this.audio.play().catch(() => {});
-    this._playLoop();
+
+    // 等待元数据加载完成后再设置起点并播放（否则 currentTime 设置无效）
+    const startPlay = () => {
+      try {
+        audio.currentTime = Math.max(0, Math.min(from, this.duration));
+      } catch (e) {}
+      audio.play().catch(() => {});
+      this._playLoop();
+    };
+    if (audio.readyState >= 1) {
+      startPlay();
+    } else {
+      audio.addEventListener("loadedmetadata", startPlay, { once: true });
+      audio.addEventListener("error", () => {
+        this.stop();
+        this.playing = false;
+        if (this.opts.onPlayState) this.opts.onPlayState(false);
+      }, { once: true });
+    }
   }
+  /** 播放选区：始终从开始手柄位置起播（若播放头在选区内则从播放头起播） */
   playSelection(url) {
     if (!url || !this.hasData) return;
     let from = this.selStart;
@@ -186,6 +236,7 @@ class WaveCanvas {
       from = this.playhead;
     }
     this.playRange(from, this.selEnd, url);
+    if (this.opts.onPlayState) this.opts.onPlayState(true);
   }
   stop() {
     this.playing = false;
@@ -199,6 +250,7 @@ class WaveCanvas {
       this.audio = null;
     }
     this.render();
+    if (this.opts.onPlayState) this.opts.onPlayState(false);
   }
   _playLoop() {
     if (!this.audio || !this.playing) return;
@@ -211,48 +263,56 @@ class WaveCanvas {
     this.playRaf = requestAnimationFrame(() => this._playLoop());
   }
 
-  // ---------------------------------------------------------- 事件
+  // ---------------------------------------------------------- 事件（Pointer Events）
   _bind() {
     const c = this.canvas;
     const rect = () => c.getBoundingClientRect();
 
-    c.addEventListener("mousedown", (e) => {
+    c.addEventListener("pointerdown", (e) => {
       const r = rect();
       const x = e.clientX - r.left;
       const t = this._xToTime(x);
       const w = c.clientWidth || c.width;
-      const edgePx = Math.max(8, w * 0.01);
+      const edgePx = 14; // 手柄命中区（像素）
       const sx = this._timeToX(this.selStart);
       const ex = this._timeToX(this.selEnd);
       const isSel = t >= this.selStart && t <= this.selEnd;
 
       if (e.button === 1) {
+        // 中键：平移视图
         e.preventDefault();
         this.dragging = "view";
         this.dragStartX = e.clientX;
         this.dragStartView = this.viewStart;
+        this.pointerId = e.pointerId;
+        c.setPointerCapture(e.pointerId);
         c.style.cursor = "grabbing";
         return;
       }
       if (e.button !== 0) return;
 
+      // 手柄优先（靠近开始/结束线）
       if (Math.abs(x - sx) <= edgePx && isSel) {
         this.dragging = "left";
       } else if (Math.abs(x - ex) <= edgePx && isSel) {
         this.dragging = "right";
       } else if (isSel) {
+        // 选区内按住左键 → 整体拖动选区
         this.dragging = "sel";
         this.dragStartSel = { s: this.selStart, e: this.selEnd };
       } else {
+        // 空白处 → 设置播放头，并开始平移视图
         this.setPlayhead(Math.max(0, Math.min(t, this.duration)));
         this.dragging = "view";
         this.dragStartX = e.clientX;
         this.dragStartView = this.viewStart;
       }
       this.dragStartX = e.clientX;
-      c.setPointerCapture && c.setPointerCapture(e.pointerId);
-      document.addEventListener("mousemove", this._bound.move);
-      document.addEventListener("mouseup", this._bound.up);
+      this.pointerId = e.pointerId;
+      c.setPointerCapture(e.pointerId);
+      c.addEventListener("pointermove", this._bound.move);
+      c.addEventListener("pointerup", this._bound.up);
+      c.addEventListener("pointercancel", this._bound.cancel);
     });
 
     c.addEventListener("wheel", (e) => {
@@ -276,7 +336,7 @@ class WaveCanvas {
   }
 
   _onMove(e) {
-    if (!this.dragging) return;
+    if (!this.dragging || (this.pointerId != null && e.pointerId !== this.pointerId)) return;
     const c = this.canvas;
     const r = c.getBoundingClientRect();
     const x = e.clientX - r.left;
@@ -305,11 +365,17 @@ class WaveCanvas {
     if (this.opts.onSelection) this.opts.onSelection();
   }
 
-  _onUp() {
+  _onUp(e) {
+    if (this.pointerId != null && e && e.pointerId !== this.pointerId) return;
     this.dragging = null;
-    this.canvas.style.cursor = "";
-    document.removeEventListener("mousemove", this._bound.move);
-    document.removeEventListener("mouseup", this._bound.up);
+    this.pointerId = null;
+    const c = this.canvas;
+    c.style.cursor = "";
+    try {
+      c.removeEventListener("pointermove", this._bound.move);
+      c.removeEventListener("pointerup", this._bound.up);
+      c.removeEventListener("pointercancel", this._bound.cancel);
+    } catch (err) {}
   }
 
   // ---------------------------------------------------------- 渲染
@@ -378,7 +444,7 @@ class WaveCanvas {
     ctx.lineTo(w, center);
     ctx.stroke();
 
-    // 时间刻度
+    // 时间刻度（按跨度自适应）
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.font = "10px monospace";
     ctx.textAlign = "left";
@@ -393,7 +459,7 @@ class WaveCanvas {
       ctx.moveTo(x, 0);
       ctx.lineTo(x, h);
       ctx.stroke();
-      ctx.fillText(fmtTime(t), x + 2, 12);
+      ctx.fillText(fmtMMSS(t), x + 2, 12);
     }
 
     // 播放头
@@ -416,7 +482,7 @@ class WaveCanvas {
       ctx.fillStyle = "rgba(255,255,255,0.75)";
       ctx.font = "bold 11px monospace";
       ctx.textAlign = "center";
-      ctx.fillText(fmtTime(this.selEnd - this.selStart) + "s", (sx + ex) / 2, 14);
+      ctx.fillText(fmtMMSS(this.selEnd - this.selStart), (sx + ex) / 2, 14);
     }
   }
 
@@ -440,13 +506,17 @@ class WaveCanvas {
 
   destroy() {
     this.stop();
-    document.removeEventListener("mousemove", this._bound.move);
-    document.removeEventListener("mouseup", this._bound.up);
+    try {
+      const c = this.canvas;
+      c.removeEventListener("pointermove", this._bound.move);
+      c.removeEventListener("pointerup", this._bound.up);
+      c.removeEventListener("pointercancel", this._bound.cancel);
+    } catch (err) {}
   }
 }
 
 // =====================================================================
-// 前端解码工具（Goohai 同款：fetch -> decodeAudioData -> 峰值）
+// 前端解码工具
 // =====================================================================
 async function decodeAudioBuffer(url) {
   const response = await fetch(url);
@@ -538,6 +608,29 @@ app.registerExtension({
         inp.click();
       });
       this.wwdmUploadZone = uploadZone;
+
+      // ---------- 已上传音频下拉框（可复用） ----------
+      this.wwdmFileSelect = $el("select", {
+        style: {
+          width: "100%",
+          background: "#0f1622",
+          color: "#dde",
+          border: "1px solid #2c3a4d",
+          borderRadius: "4px",
+          padding: "5px 7px",
+          fontSize: "12px",
+          boxSizing: "border-box",
+          marginTop: "6px",
+          display: "none",
+        },
+      });
+      this.wwdmFileSelect.addEventListener("change", () => {
+        const name = this.wwdmFileSelect.value;
+        if (!name) return;
+        this._wwdmLoadFile(name);
+      });
+      const fileRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "0" } });
+      fileRow.append(this.wwdmFileSelect);
       this.wwdmFileName = $el("div", {
         style: {
           fontSize: "11px",
@@ -560,19 +653,23 @@ app.registerExtension({
           background: "#0e1420",
           cursor: "crosshair",
           marginTop: "6px",
+          touchAction: "none",
         },
       });
       this.wwdmWc = new WaveCanvas(this.wwdmCanvas, {
         gain: 2.2,
         onSelection: () => this._wwdmSyncWidgets(),
+        onPlayState: (playing) => {
+          this.wwdmBtnPlay.textContent = playing ? "⏹ 停止" : "▶ 播放";
+        },
       });
 
-      // ---------- 时间输入行 ----------
+      // ---------- 时间输入行（mm:ss 格式） ----------
       const mkInput = (label, ref) => {
         const inp = $el("input", {
-          type: "number",
-          step: "0.01",
-          min: "0",
+          type: "text",
+          placeholder: "mm:ss",
+          spellcheck: "false",
           style: {
             width: "100%",
             background: "#0f1622",
@@ -582,6 +679,7 @@ app.registerExtension({
             padding: "5px 7px",
             fontSize: "12px",
             boxSizing: "border-box",
+            fontFamily: "monospace",
           },
         });
         const lab = $el("label", {
@@ -600,9 +698,9 @@ app.registerExtension({
       };
       const inputRow = $el("div", { style: { display: "flex", gap: "8px", marginTop: "6px" } });
       inputRow.append(
-        mkInput("开始时间 (s)", "wwdmInpStart"),
-        mkInput("结束时间 (s)", "wwdmInpEnd"),
-        mkInput("选取时长 (s)", "wwdmInpDur")
+        mkInput("开始时间", "wwdmInpStart"),
+        mkInput("结束时间", "wwdmInpEnd"),
+        mkInput("选取时长", "wwdmInpDur")
       );
 
       // ---------- 按钮行 ----------
@@ -626,7 +724,7 @@ app.registerExtension({
       btnRow.append(this.wwdmBtnPlay, hint);
 
       const wrap = $el("div", { style: { width: "100%", padding: "2px 0" } });
-      wrap.append(uploadZone, this.wwdmFileName, this.wwdmCanvas, inputRow, btnRow);
+      wrap.append(uploadZone, fileRow, this.wwdmFileName, this.wwdmCanvas, inputRow, btnRow);
       this.wwdmUiEl = wrap;
 
       if (this.addDOMWidget) {
@@ -636,51 +734,48 @@ app.registerExtension({
         if (container) container.appendChild(wrap);
       }
 
-      // ---------- 输入框事件 ----------
+      // ---------- 输入框事件（mm:ss，双向同步） ----------
       this._wwdmGuard = false;
       this.wwdmInpStart.addEventListener("input", () => {
         if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseFloat(this.wwdmInpStart.value);
-        if (isFinite(v) && v >= 0) {
-          const dur = this.wwdmWc.duration;
-          const s = Math.min(v, dur);
-          const e = Math.max(s + 0.01, this.wwdmWc.selEnd);
-          this.wwdmWc.setSelection(s, e);
-        }
+        const v = parseTime(this.wwdmInpStart.value);
+        if (v == null) return;
+        const dur = this.wwdmWc.duration;
+        const s = Math.min(v, dur);
+        const e = Math.max(s + 0.01, this.wwdmWc.selEnd);
+        this.wwdmWc.setSelection(s, e);
       });
       this.wwdmInpEnd.addEventListener("input", () => {
         if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseFloat(this.wwdmInpEnd.value);
-        if (isFinite(v) && v >= 0) {
-          const e = Math.min(v, this.wwdmWc.duration);
-          const s = Math.min(e - 0.01, this.wwdmWc.selStart);
-          this.wwdmWc.setSelection(s, e);
-        }
+        const v = parseTime(this.wwdmInpEnd.value);
+        if (v == null) return;
+        const e = Math.min(v, this.wwdmWc.duration);
+        const s = Math.min(e - 0.01, this.wwdmWc.selStart);
+        this.wwdmWc.setSelection(s, e);
       });
       this.wwdmInpDur.addEventListener("input", () => {
         if (this._wwdmGuard || !this.wwdmWc.hasData) return;
-        const v = parseFloat(this.wwdmInpDur.value);
-        if (isFinite(v) && v >= 0) {
-          this.wwdmWc.setDuration(v);
-        }
+        const v = parseTime(this.wwdmInpDur.value);
+        if (v == null) return;
+        this.wwdmWc.setDuration(v);
       });
 
       // ---------- 播放按钮 ----------
       this.wwdmBtnPlay.addEventListener("click", () => {
-        if (!this.wwdmAudioUrl && !this._wwdmCurrentName) {
-          alert("请先上传音频文件");
+        const url = this.wwdmAudioUrl || (this._wwdmCurrentName ? makeFileUrl(this._wwdmCurrentName) : "");
+        if (!url) {
+          alert("请先上传或选择音频文件");
           return;
         }
         if (!this.wwdmWc.hasData) {
-          alert("波形尚未加载，请稍候或重新上传");
+          alert("波形尚未加载，请稍候或重新选择");
           return;
         }
         if (this.wwdmWc.playing) {
           this.wwdmWc.stop();
-          this.wwdmBtnPlay.textContent = "▶ 播放";
         } else {
-          this.wwdmWc.playSelection(this.wwdmAudioUrl || makeFileUrl(this._wwdmCurrentName));
-          this.wwdmBtnPlay.textContent = "⏹ 停止";
+          // 从开始手柄位置播放到结束手柄位置
+          this.wwdmWc.playSelection(url);
         }
       });
 
@@ -696,15 +791,8 @@ app.registerExtension({
           if (!response.ok) throw new Error("上传失败: HTTP " + response.status);
           const result = await response.json();
           const name = [result.subfolder, result.name].filter(Boolean).join("/");
-          this._wwdmCurrentName = name;
-          this.wwdmFileName.textContent = "已上传: " + name;
+          await this._wwdmLoadFile(name);
           this.wwdmUploadZone.textContent = "📂 点击或拖拽重新上传";
-          // 写入隐藏 widget
-          const wf = this.widgets?.find((x) => x.name === "audio_file");
-          if (wf) wf.value = name;
-          this.wwdmAudioUrl = makeFileUrl(name);
-          // 前端解码画波形（立即显示，无需执行）
-          await this._wwdmLoadFromUrl(makeFileUrl(name), name);
         } catch (err) {
           console.error("[wwdm] 上传失败", err);
           this.wwdmUploadZone.textContent = "❌ 上传失败，点击重试";
@@ -712,10 +800,25 @@ app.registerExtension({
         }
       };
 
-      this._wwdmLoadFromUrl = async (url, name) => {
+      /** 加载已上传/已选择的音频文件（写入 widget + 解码画波形） */
+      this._wwdmLoadFile = async (name) => {
+        if (!name) return;
+        this._wwdmCurrentName = name;
+        const wf = this.widgets?.find((x) => x.name === "audio_file");
+        if (wf) wf.value = name;
+        this.wwdmFileName.textContent = "已加载: " + name;
+        this.wwdmAudioUrl = makeFileUrl(name);
+        const sel = this.wwdmFileSelect;
+        if (sel && ![...sel.options].some((o) => o.value === name)) {
+          const opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = name;
+          sel.appendChild(opt);
+        }
+        if (sel) sel.value = name;
         try {
           this.wwdmCanvas.style.opacity = "0.45";
-          const buffer = await decodeAudioBuffer(url);
+          const buffer = await decodeAudioBuffer(makeFileUrl(name));
           const peaks = bufferToPeaks(buffer, 1200);
           const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
           this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
@@ -729,15 +832,47 @@ app.registerExtension({
         }
       };
 
-      // 恢复已保存的音频文件（工作流加载后）
+      // ---------- 刷新已上传文件列表 ----------
+      this._wwdmRefreshFiles = async () => {
+        try {
+          const res = await api.fetchApi("/wwdm/audio/files");
+          if (!res.ok) return;
+          const data = await res.json();
+          const files = data.files || [];
+          const sel = this.wwdmFileSelect;
+          const cur = this._wwdmCurrentName;
+          // 重建选项
+          sel.innerHTML = "";
+          if (!files.length) {
+            sel.style.display = "none";
+            return;
+          }
+          sel.style.display = "block";
+          const ph = document.createElement("option");
+          ph.value = "";
+          ph.textContent = "已上传音频…";
+          sel.appendChild(ph);
+          for (const f of files) {
+            const opt = document.createElement("option");
+            opt.value = f;
+            opt.textContent = f;
+            sel.appendChild(opt);
+          }
+          if (cur && files.includes(cur)) {
+            sel.value = cur;
+          }
+        } catch (err) {
+          console.error("[wwdm] 刷新文件列表失败", err);
+        }
+      };
+
+      // ---------- 初始化：恢复已保存文件 + 拉取文件列表 ----------
       const wf = this.widgets?.find((x) => x.name === "audio_file");
       if (wf?.value) {
         const name = String(wf.value);
-        this._wwdmCurrentName = name;
-        this.wwdmFileName.textContent = "已加载: " + name;
-        this.wwdmAudioUrl = makeFileUrl(name);
-        this._wwdmLoadFromUrl(makeFileUrl(name), name);
+        this._wwdmLoadFile(name);
       }
+      this._wwdmRefreshFiles();
 
       return r;
     };
@@ -754,9 +889,9 @@ app.registerExtension({
         if (ws) ws.value = start;
         if (we) we.value = end;
         if (wd) wd.value = dur;
-        if (this.wwdmInpStart) this.wwdmInpStart.value = fmtTime(start);
-        if (this.wwdmInpEnd) this.wwdmInpEnd.value = fmtTime(end);
-        if (this.wwdmInpDur) this.wwdmInpDur.value = fmtTime(dur);
+        if (this.wwdmInpStart) this.wwdmInpStart.value = fmtMMSS(start);
+        if (this.wwdmInpEnd) this.wwdmInpEnd.value = fmtMMSS(end);
+        if (this.wwdmInpDur) this.wwdmInpDur.value = fmtMMSS(dur);
       } finally {
         this._wwdmGuard = false;
       }
@@ -819,6 +954,7 @@ app.registerExtension({
     style.textContent = `
       .wwdm-widget button:hover { filter: brightness(1.15); }
       .wwdm-widget input:focus { outline: 1px solid #2f6fb3; }
+      .wwdm-widget select:focus { outline: 1px solid #2f6fb3; }
     `;
     document.head.appendChild(style);
   },
