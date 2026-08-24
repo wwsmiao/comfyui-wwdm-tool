@@ -378,5 +378,8 @@ class WWDMAudioCrop:
 
             logging.getLogger("wwdm.audio").warning("波形 UI 数据构造失败: %s", exc)
 
-        # 元组最后一项携带 {'ui': ...}，执行引擎会提取为 executed 消息的 output 字段
-        return (cropped, s, e, e - s, preview, {"ui": ui})
+        # 返回 dict：result 携带 5 个输出值，ui 携带前端面板数据
+        # 注意：必须用 {'result': (...), 'ui': {...}} 结构！
+        # 若返回裸元组 + 尾随 {'ui': ...}，get_output_from_returns 会把整个元组
+        # 当作单个 result，ui 永远不会被收集（uis 为空 → 不发 executed）
+        return {"result": (cropped, s, e, e - s, preview), "ui": ui}
