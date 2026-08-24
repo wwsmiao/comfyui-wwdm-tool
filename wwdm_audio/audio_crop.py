@@ -46,21 +46,31 @@ except Exception:
 # 时间解析（mm:ss 格式）
 # =====================================================================
 def _parse_time(v, default=0.0):
-    """解析 mm:ss / mm:ss.xxx / 纯秒 → float 秒；无效返回 default"""
+    """解析 hh:mm:ss.s / mm:ss.s / 纯秒 → float 秒；无效返回 default"""
     if v is None:
         return default
     s = str(v).strip()
     if not s:
         return default
+    # 纯秒（数字）
     if re.fullmatch(r"\d+(\.\d+)?", s):
         return float(s)
-    m = re.fullmatch(r"(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?", s)
+    # hh:mm:ss(.s)
+    m = re.fullmatch(r"(\d{1,3}):(\d{1,2}):(\d{1,2})(?:\.(\d+))?", s)
     if m:
-        sec = int(m.group(2))
-        if sec >= 60:
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if mm >= 60 or ss >= 60:
+            return default
+        frac = float("0." + m.group(4)) if m.group(4) else 0.0
+        return hh * 3600 + mm * 60 + ss + frac
+    # mm:ss(.s)
+    m = re.fullmatch(r"(\d{1,3}):(\d{1,2})(?:\.(\d+))?", s)
+    if m:
+        mm, ss = int(m.group(1)), int(m.group(2))
+        if ss >= 60:
             return default
         frac = float("0." + m.group(3)) if m.group(3) else 0.0
-        return int(m.group(1)) * 60 + sec + frac
+        return mm * 60 + ss + frac
     try:
         return float(s)
     except Exception:
