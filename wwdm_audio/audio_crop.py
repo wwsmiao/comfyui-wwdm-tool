@@ -351,6 +351,8 @@ class WWDMAudioCrop:
             logging.getLogger("wwdm.audio").warning("裁剪结果保存失败（不影响输出）: %s", exc)
 
         # ---- 构造 UI 消息（全音频波形 + 播放 URL + 裁剪 URL）----
+        # 注意：ComfyUI get_output_from_returns 合并 ui 时要求每个值都是列表
+        # （ui = {k: [y for x in uis for y in x[k]] ...}），裸 dict/字符串会被迭代破坏
         ui = {}
         try:
             wf3 = waveform
@@ -359,16 +361,18 @@ class WWDMAudioCrop:
             mono = wf3[0].mean(dim=0).float().cpu().numpy()
             peaks = compute_peaks(mono, 1200).tolist()
             maxv = float(np.max(np.abs(mono))) if mono.size else 0.0
-            ui["wwdm_waveform"] = {
-                "peaks": peaks,
-                "sample_rate": sample_rate,
-                "duration": total_sec,
-                "max": maxv,
-            }
+            ui["wwdm_waveform"] = [
+                {
+                    "peaks": peaks,
+                    "sample_rate": sample_rate,
+                    "duration": total_sec,
+                    "max": maxv,
+                }
+            ]
             if audio_url:
-                ui["wwdm_audio_url"] = audio_url
+                ui["wwdm_audio_url"] = [audio_url]
             if crop_url:
-                ui["wwdm_crop_url"] = crop_url
+                ui["wwdm_crop_url"] = [crop_url]
         except Exception as exc:
             import logging
 

@@ -957,10 +957,24 @@ app.registerExtension({
     const onExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (message) {
       const r = onExecuted?.apply(this, arguments);
-      if (message?.wwdm_waveform) {
-        const wf = message.wwdm_waveform;
+      // 后端 executed 消息的 ui 字段值都是数组（get_output_from_returns 合并逻辑），
+      // 需取 [0]；也兼容直接对象
+      const pick = (v) => (Array.isArray(v) ? v[0] : v);
+      const wf = pick(message?.wwdm_waveform);
+      const audioUrl = pick(message?.wwdm_audio_url);
+      if (wf && Array.isArray(wf.peaks) && wf.peaks.length) {
+        // 保留用户已设置的时间参数：执行后手柄反映 start/end/duration 值
+        const w = (name) => this.widgets?.find((x) => x.name === name);
+        const sv = parseTime(w("start_time")?.value);
+        const ev = parseTime(w("end_time")?.value);
+        const dv = parseTime(w("duration")?.value);
         this.wwdmWc.setData(wf.peaks, wf.sample_rate, wf.duration);
-        if (message.wwdm_audio_url) this.wwdmAudioUrl = message.wwdm_audio_url;
+        let s = 0, e = this.wwdmWc.duration;
+        if (sv != null && sv >= 0) s = Math.min(sv, e);
+        if (dv != null && dv > 0) e = Math.min(e, s + dv);
+        else if (ev != null && ev > 0) e = Math.min(e, Math.max(ev, s + 0.01));
+        this.wwdmWc.setSelection(s, e);
+        if (audioUrl) this.wwdmAudioUrl = audioUrl;
         this._wwdmSyncWidgets();
       }
       return r;
@@ -970,8 +984,10 @@ app.registerExtension({
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (info) {
       const r = onConfigure?.apply(this, arguments);
-      if (info?.wwdm_waveform) {
-        this.wwdmWc.setData(info.wwdm_waveform.peaks, info.wwdm_waveform.sample_rate, info.wwdm_waveform.duration);
+      const pick = (v) => (Array.isArray(v) ? v[0] : v);
+      const wf = pick(info?.wwdm_waveform);
+      if (wf && Array.isArray(wf.peaks) && wf.peaks.length) {
+        this.wwdmWc.setData(wf.peaks, wf.sample_rate, wf.duration);
       }
       return r;
     };
