@@ -1,5 +1,11 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.1）
+ *
+ * v8.1 优化（用户反馈）：
+ *   1. 输出只保留裁剪后的 audio 音频（去掉 start/end/duration/preview 输出）
+ *   2. 修复结束手柄无法拖动：手柄命中判定改为纯像素距离（不依赖选区时间
+ *      区间 isSel），避免结束手柄在音频末尾时鼠标落点在手柄右侧导致
+ *      判定失败落入画布平移；拖动改为偏移量方式精确跟随指针
  *
  * v8 优化（用户需求）：
  *   1. 去掉节点上半部分的 start_time/end_time/duration 原生参数 widget
@@ -19,7 +25,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.0.0";
+const WWDM_VERSION = "v8.1.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -282,10 +288,16 @@ class WaveCanvas {
       }
       if (e.button !== 0) return;
 
-      if (Math.abs(x - sx) <= edgePx && isSel) {
-        this.dragging = "left";
-      } else if (Math.abs(x - ex) <= edgePx && isSel) {
+      // 手柄判定：纯像素距离优先（不依赖 isSel）
+      // 结束手柄在音频末尾时，鼠标落点常在右侧（t > selEnd → isSel=false），
+      // 旧逻辑会落入 view 分支导致结束手柄拖不动；改为像素距离直接命中。
+      // 先判 right 再判 left，避免小选区/重叠时误判为左手柄。
+      if (Math.abs(x - ex) <= edgePx) {
         this.dragging = "right";
+        this.dragStartSel = { s: this.selStart, e: this.selEnd };
+      } else if (Math.abs(x - sx) <= edgePx) {
+        this.dragging = "left";
+        this.dragStartSel = { s: this.selStart, e: this.selEnd };
       } else if (isSel) {
         this.dragging = "sel";
         this.dragStartSel = { s: this.selStart, e: this.selEnd };
@@ -334,9 +346,12 @@ class WaveCanvas {
     const minGap = 0.01;
 
     if (this.dragging === "left") {
-      this.selStart = Math.max(0, Math.min(t, this.selEnd - minGap));
+      // 偏移量方式：手柄跟随指针精确移动，避免绝对 t 在边界时被钳制
+      const s = this.dragStartSel.s + dt;
+      this.selStart = Math.max(0, Math.min(s, this.selEnd - minGap));
     } else if (this.dragging === "right") {
-      this.selEnd = Math.min(dur, Math.max(t, this.selStart + minGap));
+      const en = this.dragStartSel.e + dt;
+      this.selEnd = Math.min(dur, Math.max(en, this.selStart + minGap));
     } else if (this.dragging === "sel") {
       let s = this.dragStartSel.s + dt;
       let en = this.dragStartSel.e + dt;

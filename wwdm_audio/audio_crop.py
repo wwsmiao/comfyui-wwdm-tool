@@ -14,11 +14,7 @@ WWDMAudioCrop 节点 —— 音频可视化裁剪（v4，节点内上传）
     duration   - 选取时长（秒，>0 时强制 end = start + duration）
 
 输出：
-    audio    - 裁剪后的音频（AUDIO）
-    start    - 实际裁剪开始时间（秒）
-    end      - 实际裁剪结束时间（秒）
-    duration - 实际裁剪时长（秒）
-    preview  - 原始音频波形预览图（IMAGE，RGB）
+    audio - 裁剪后的音频（AUDIO）
 
 UI 消息（executed 时返回给前端）：
     wwdm_waveform  - {peaks, sample_rate, duration, max} 全音频波形峰值
@@ -242,8 +238,8 @@ class WWDMAudioCrop:
             },
         }
 
-    RETURN_TYPES = ("AUDIO", "FLOAT", "FLOAT", "FLOAT", "IMAGE")
-    RETURN_NAMES = ("audio", "start", "end", "duration", "preview")
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
     FUNCTION = "crop"
     CATEGORY = "wwdm-tool/audio"
     DESCRIPTION = "可视化截取波形音频：开始/结束手柄 + 播放 + 手动输入时间 + 时长联动"
@@ -316,15 +312,6 @@ class WWDMAudioCrop:
 
         cropped = {"waveform": waveform[..., start_frame:end_frame].clone(), "sample_rate": sample_rate}
 
-        # ---- 预览图（RGB）----
-        preview = None
-        try:
-            img = render_waveform_image(waveform, sample_rate)
-            if img is not None:
-                preview = torch.from_numpy(img)[None, ...]  # [1,H,W,3]
-        except Exception:
-            preview = None
-
         out_dir = os.path.join(folder_paths.get_output_directory(), "wwdm_audio_crop")
         os.makedirs(out_dir, exist_ok=True)
 
@@ -378,8 +365,8 @@ class WWDMAudioCrop:
 
             logging.getLogger("wwdm.audio").warning("波形 UI 数据构造失败: %s", exc)
 
-        # 返回 dict：result 携带 5 个输出值，ui 携带前端面板数据
+        # 返回 dict：result 携带裁剪音频输出，ui 携带前端面板数据
         # 注意：必须用 {'result': (...), 'ui': {...}} 结构！
         # 若返回裸元组 + 尾随 {'ui': ...}，get_output_from_returns 会把整个元组
         # 当作单个 result，ui 永远不会被收集（uis 为空 → 不发 executed）
-        return {"result": (cropped, s, e, e - s, preview), "ui": ui}
+        return {"result": (cropped,), "ui": ui}
