@@ -1,5 +1,10 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.4）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.5）
+ *
+ * v8.5 修复（用户反馈）：节点默认打开后外框没有包裹住按钮
+ *   根因：DOM widget computeSize 固定 310 < 实际内容高度（~327），按钮行溢出外框。
+ *   修复：computeSize 提至 345 兜底 + 渲染后测量 wrap 实际高度自适应（+4 余量），
+ *   节点总高度 needed 380→400。
  *
  * v8.4 修复（用户反馈）：更换输入音频后再点预加载，跳回第一次选择的音频
  *   根因：预加载把上游 LoadAudio 解析到的文件名写入了 audio_file widget，
@@ -40,7 +45,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.4.0";
+const WWDM_VERSION = "v8.5.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -735,9 +740,33 @@ app.registerExtension({
 
       if (this.addDOMWidget) {
         this.wwdmWidget = this.addDOMWidget("wwdm_ui", "wwdm_ui", wrap, { serialize: false });
+        // 高度自适应：测量 wrap 实际内容高度，确保按钮行等全部被节点外框包裹
+        // （用户反馈：默认打开后外框没包住按钮 → 固定 310 不够）
+        // 默认兜底（首次测量前）：按内容估算 345
         this.wwdmWidget.computeSize = function (width) {
-          return [width || 320, 310];
+          return [width || 320, 345];
         };
+        // 等 DOM 渲染完成后测量一次，更新 computeSize（ComfyUI 布局时主动调用）
+        const tryMeasure = () => {
+          try {
+            const h = wrap.scrollHeight || wrap.offsetHeight;
+            if (h > 20 && h !== 345) {
+              this.wwdmWidget.computeSize = function (width) {
+                return [width || 320, h + 4]; // +4 余量防溢出
+              };
+              // 触发画布重算布局（不直接改 size，避免宽度被强制重置）
+              this.graph?.setDirtyCanvas?.(true, true);
+            } else if (h <= 20) {
+              // 尚未挂载渲染，延迟重试（最多 5 次）
+              if ((tryMeasure.retry = (tryMeasure.retry || 0) + 1) <= 5) {
+                setTimeout(tryMeasure, 200);
+              }
+            }
+          } catch (e) {
+            /* 测量失败保持兜底高度 */
+          }
+        }.bind(this);
+        setTimeout(tryMeasure, 50);
       } else {
         const container = this.el || this.nodeEl || this.constructor?.nodeEl;
         if (container) container.appendChild(wrap);
@@ -748,7 +777,7 @@ app.registerExtension({
       const origComputeSize = this.computeSize?.bind(this);
       this.computeSize = function (w) {
         const base = origComputeSize ? origComputeSize(w) : [360, 400];
-        const needed = 380; // 上传区(38)+下拉(30)+文件名(20)+画布(150)+输入行(52)+按钮行(38)+边距(~52)
+        const needed = 400; // 上传区(38)+下拉(34)+文件名(18)+画布(156)+输入行(45)+按钮行(36)+边距(~73)
         return [base[0], Math.max(base[1], needed)];
       };
 
