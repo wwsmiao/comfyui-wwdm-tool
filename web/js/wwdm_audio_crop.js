@@ -1,5 +1,10 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.1）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.2）
+ *
+ * v8.2 修复（用户反馈）：同步按钮无法从输入的 AUDIO 加载波形
+ *   根因：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），
+ *   _wwdmResolveSource 用 links.find() 直接 TypeError，同步中断。
+ *   修复：兼容 Map（.get）与数组（.find）两种结构。
  *
  * v8.1 优化（用户反馈）：
  *   1. 输出只保留裁剪后的 audio 音频（去掉 start/end/duration/preview 输出）
@@ -25,7 +30,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.1.0";
+const WWDM_VERSION = "v8.2.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -918,9 +923,13 @@ app.registerExtension({
       const wf = this.widgets?.find((x) => x.name === "audio_file");
       if (wf?.value && String(wf.value).trim()) return String(wf.value).trim();
       // 2) 上游 LoadAudio 节点的音频文件名
+      //    注意：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），需兼容两种结构
       const inp = this.inputs?.find((x) => x.name === "audio");
       if (inp?.link != null && app?.graph) {
-        const link = app.graph.links.find((l) => l.id === inp.link);
+        const links = app.graph.links;
+        const link = Array.isArray(links)
+          ? links.find((l) => l.id === inp.link)
+          : links?.get?.(inp.link);
         const src = link ? app.graph.getNodeById(link.origin_id) : null;
         if (src) {
           // LoadAudio 的 audio 参数
