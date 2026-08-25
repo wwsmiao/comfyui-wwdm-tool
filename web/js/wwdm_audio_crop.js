@@ -1,10 +1,15 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.3）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.4）
+ *
+ * v8.4 修复（用户反馈）：更换输入音频后再点预加载，跳回第一次选择的音频
+ *   根因：预加载把上游 LoadAudio 解析到的文件名写入了 audio_file widget，
+ *   而解析源优先读 widget → widget 被固化旧音频。
+ *   修复：解析源区分来源（_wwdmResolveSourceInfo 返回 fromUpload 标记）；
+ *   仅节点内上传才写 audio_file widget，上游 LoadAudio 来源写空保持实时读取。
  *
  * v8.3 优化（用户需求）：同步/预加载功能分离
  *   1. 「🔄 同步」按钮只同步时间选择与手柄位置（不加载波形）
  *   2. 新增「⏬ 预加载」按钮：从输入端获取当前音频并刷新波形
- *      （每次强制重新解码，解决更换输入音频后点击无效的问题）
  *
  * v8.2 修复（用户反馈）：同步按钮无法从输入的 AUDIO 加载波形
  *   根因：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），
@@ -35,7 +40,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.3.0";
+const WWDM_VERSION = "v8.4.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -926,11 +931,13 @@ app.registerExtension({
       this._wwdmSyncWidgets();
     };
 
-    // ---------- 解析音频源（优先节点内上传 audio_file，其次上游 LoadAudio） ----------
-    nodeType.prototype._wwdmResolveSource = function () {
+    // ---------- 解析音频源（返回 {name, fromUpload}：fromUpload=true 表示节点内上传） ----------
+    nodeType.prototype._wwdmResolveSourceInfo = function () {
       // 1) 节点内上传的 audio_file
       const wf = this.widgets?.find((x) => x.name === "audio_file");
-      if (wf?.value && String(wf.value).trim()) return String(wf.value).trim();
+      if (wf?.value && String(wf.value).trim()) {
+        return { name: String(wf.value).trim(), fromUpload: true };
+      }
       // 2) 上游 LoadAudio 节点的音频文件名
       //    注意：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），需兼容两种结构
       const inp = this.inputs?.find((x) => x.name === "audio");
@@ -943,15 +950,23 @@ app.registerExtension({
         if (src) {
           // LoadAudio 的 audio 参数
           const aw = src.widgets?.find((x) => x.name === "audio");
-          if (aw?.value && String(aw.value).trim()) return String(aw.value).trim();
+          if (aw?.value && String(aw.value).trim()) {
+            return { name: String(aw.value).trim(), fromUpload: false };
+          }
           // 兼容：第一个 widget 恰好是文件名的场景
           const w0 = src.widgets?.[0];
           if (w0?.value && typeof w0.value === "string" && String(w0.value).trim()) {
-            return String(w0.value).trim();
+            return { name: String(w0.value).trim(), fromUpload: false };
           }
         }
       }
       return null;
+    };
+
+    // ---------- 解析音频源（兼容旧调用：返回文件名或 null） ----------
+    nodeType.prototype._wwdmResolveSource = function () {
+      const info = this._wwdmResolveSourceInfo();
+      return info ? info.name : null;
     };
 
     // ---------- 同步（v8.3：只同步时间选择与手柄位置，不加载波形） ----------
@@ -976,10 +991,11 @@ app.registerExtension({
       this._wwdmSyncWidgets();
     };
 
-    // ---------- 预加载（v8.3：从输入端获取当前音频并刷新波形，每次强制重新解码） ----------
+    // ---------- 预加载（v8.4：从输入端获取当前音频并刷新波形，每次强制重新解码） ----------
     nodeType.prototype._wwdmPreload = async function () {
       if (!this.wwdmWc) return;
-      const name = this._wwdmResolveSource();
+      const info = this._wwdmResolveSourceInfo();
+      const name = info ? info.name : null;
       if (!name) {
         alert("未找到音频：请在节点内上传音频，或连接 LoadAudio 的 AUDIO 输入");
         return;
@@ -994,8 +1010,14 @@ app.registerExtension({
         this.wwdmCanvas.style.opacity = "1";
         // 更新来源展示（强制刷新：即使同名也刷新 UI，解决更换输入音频后点击无效）
         this._wwdmCurrentName = name;
+        // 仅节点内上传才写入 audio_file widget；上游 LoadAudio 来源不写 widget，
+        // 保持 widget 为空 → 下次解析仍读上游当前音频（否则会固化旧音频导致跳回第一次）
         const wf = this.widgets?.find((x) => x.name === "audio_file");
-        if (wf) wf.value = name;
+        if (info.fromUpload) {
+          if (wf) wf.value = name;
+        } else if (wf) {
+          wf.value = "";
+        }
         this.wwdmFileName.textContent = "已加载: " + name;
         this.wwdmAudioUrl = url;
         const sel = this.wwdmFileSelect;
