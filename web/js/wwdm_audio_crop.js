@@ -1,15 +1,15 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v7）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8）
  *
- * v7 优化（基于用户实测反馈）：
- *   1. 所有时间选择同步为 hh:mm:ss 格式（时分秒），秒数后只保留一位小数
- *   2. 上部分「duration」与下界面「选取时长」双向同步；duration 与选取时长
- *      用秒数保留一位小数（如 10.0），不用 mm:ss/hh:mm:ss
- *   3. 同步按钮逻辑改为：根据「开始时间 + duration」同步其他部分，
- *      用户只需改开始时间和截取时长
- *   4. 节点高度进一步调整，彻底覆盖播放/同步按钮
+ * v8 优化（用户需求）：
+ *   1. 去掉节点上半部分的 start_time/end_time/duration 原生参数 widget
+ *      （前端隐藏，视觉上消失）；保留波形下方的「开始时间/结束时间/选取时长」
+ *      输入框 + audio_file 上传功能。隐藏 widget 仍序列化，执行时正常传参。
+ *   2. 「🔄 同步」按钮功能改为：从输入的 audio 加载波形（优先节点内上传的
+ *      audio_file，其次上游 LoadAudio 节点），同时同步开始时间、结束时间、
+ *      选取时长和波形手柄位置。
  *
- * 架构（沿用 v4-v6）：
+ * 架构（沿用 v4-v7）：
  *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码画波形 → <audio> 播放
  */
 import { app } from "../../../scripts/app.js";
@@ -19,7 +19,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v7.0.0";
+const WWDM_VERSION = "v8.0.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -712,13 +712,27 @@ app.registerExtension({
         if (container) container.appendChild(wrap);
       }
 
-      // 节点高度覆盖（确保上传区/画布/输入行/播放/同步按钮全部可见）
+      // 节点高度覆盖（确保上传区/画布/输入行/播放/同步按钮全部可见；
+      // 原生 start/end/duration widget 已隐藏，高度相应缩减）
       const origComputeSize = this.computeSize?.bind(this);
       this.computeSize = function (w) {
         const base = origComputeSize ? origComputeSize(w) : [360, 400];
-        const needed = 460; // 上传区(38)+下拉(30)+文件名(20)+画布(156)+输入行(52)+按钮行(36)+widgets(~100)+边距
+        const needed = 376; // 上传区(38)+下拉(30)+文件名(20)+画布(150)+输入行(52)+按钮行(36)+边距(~50)
         return [base[0], Math.max(base[1], needed)];
       };
+
+      // ---------- 隐藏原生 start_time/end_time/duration + audio_file 参数（v8） ----------
+      // 需求：去掉节点上半部分的三个参数，只保留波形下方的输入框。
+      // 用 computeSize 折叠 widget，使其在面板上不渲染；但 widget 仍留在
+      // this.widgets 中，值会被序列化并随执行传给后端 crop()，保证功能不变。
+      // audio_file 是上传路径的存储载体，同样隐藏（上传/选择走按钮+下拉框）。
+      for (const nm of ["start_time", "end_time", "duration", "audio_file"]) {
+        const w = this.widgets?.find((x) => x.name === nm);
+        if (w) {
+          w.hidden = true;
+          w.computeSize = () => [0, -4];
+        }
+      }
 
       // ---------- 输入框事件（hh:mm:ss / 秒） ----------
       this._wwdmGuard = false;
@@ -741,14 +755,8 @@ app.registerExtension({
         });
       }
 
-      // ---------- 同步按钮（开始时间 + duration → 同步其他） ----------
-      this.wwdmBtnSync.addEventListener("click", () => {
-        if (!this.wwdmWc.hasData) {
-          alert("请先上传或选择音频文件");
-          return;
-        }
-        this._wwdmSyncAll();
-      });
+      // ---------- 同步按钮（v8：从输入 audio 加载波形 + 同步全部） ----------
+      this.wwdmBtnSync.addEventListener("click", () => this._wwdmSyncAll());
 
       // ---------- 播放按钮 ----------
       this.wwdmBtnPlay.addEventListener("click", () => {
@@ -889,20 +897,75 @@ app.registerExtension({
       this._wwdmSyncWidgets();
     };
 
-    // ---------- 一键同步全部（开始时间 + duration → 其他） ----------
-    nodeType.prototype._wwdmSyncAll = function () {
-      if (!this.wwdmWc?.hasData) return;
+    // ---------- 解析音频源（优先节点内上传 audio_file，其次上游 LoadAudio） ----------
+    nodeType.prototype._wwdmResolveSource = function () {
+      // 1) 节点内上传的 audio_file
+      const wf = this.widgets?.find((x) => x.name === "audio_file");
+      if (wf?.value && String(wf.value).trim()) return String(wf.value).trim();
+      // 2) 上游 LoadAudio 节点的音频文件名
+      const inp = this.inputs?.find((x) => x.name === "audio");
+      if (inp?.link != null && app?.graph) {
+        const link = app.graph.links.find((l) => l.id === inp.link);
+        const src = link ? app.graph.getNodeById(link.origin_id) : null;
+        if (src) {
+          // LoadAudio 的 audio 参数
+          const aw = src.widgets?.find((x) => x.name === "audio");
+          if (aw?.value && String(aw.value).trim()) return String(aw.value).trim();
+          // 兼容：第一个 widget 恰好是文件名的场景
+          const w0 = src.widgets?.[0];
+          if (w0?.value && typeof w0.value === "string" && String(w0.value).trim()) {
+            return String(w0.value).trim();
+          }
+        }
+      }
+      return null;
+    };
+
+    // ---------- 一键同步（v8：从输入 audio 加载波形 + 同步时间与手柄） ----------
+    nodeType.prototype._wwdmSyncAll = async function () {
+      if (!this.wwdmWc) return;
+      // 1) 解析音频源并加载波形
+      const name = this._wwdmResolveSource();
+      if (!name) {
+        alert("未找到音频：请在节点内上传音频，或连接 LoadAudio 的 AUDIO 输入");
+        return;
+      }
+      const url = makeFileUrl(name);
+      try {
+        const buffer = await decodeAudioBuffer(url);
+        const peaks = bufferToPeaks(buffer, 1200);
+        const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
+        this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
+        // 记录来源（若与当前不同，同步 UI 展示）
+        if (this._wwdmCurrentName !== name) {
+          this._wwdmCurrentName = name;
+          const wf = this.widgets?.find((x) => x.name === "audio_file");
+          if (wf) wf.value = name;
+          this.wwdmFileName.textContent = "已加载: " + name;
+          this.wwdmAudioUrl = url;
+          const sel = this.wwdmFileSelect;
+          if (sel && ![...sel.options].some((o) => o.value === name)) {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            sel.appendChild(opt);
+          }
+          if (sel) sel.value = name;
+        }
+      } catch (err) {
+        console.error("[wwdm] 同步加载波形失败", err);
+        alert("波形加载失败: " + String(err.message || err));
+        return;
+      }
+      // 2) 按输入行时间参数同步手柄：开始时间 / 选取时长(优先) / 结束时间
       const { sv, ev, dv } = this._wwdmReadInputs();
       const dur = this.wwdmWc.duration;
-      const cur = this.wwdmWc.selection;
-      let s = cur.start, e = cur.end;
-
-      // 根据「开始时间 + duration」同步其他部分（duration 优先于结束时间）
-      if (sv != null) s = Math.min(Math.max(0, sv), dur);
+      let s = 0, e = dur;
+      if (sv != null && sv >= 0) s = Math.min(sv, dur);
       if (dv != null && dv > 0) {
         e = Math.min(dur, s + dv);
       } else if (ev != null && ev > 0) {
-        e = Math.min(Math.max(s + 0.01, ev), dur);
+        e = Math.min(dur, Math.max(ev, s + 0.01));
       }
       if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
       this.wwdmWc.setSelection(s, e);
