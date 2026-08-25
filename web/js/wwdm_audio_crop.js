@@ -1,5 +1,10 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.2）
+ * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.3）
+ *
+ * v8.3 优化（用户需求）：同步/预加载功能分离
+ *   1. 「🔄 同步」按钮只同步时间选择与手柄位置（不加载波形）
+ *   2. 新增「⏬ 预加载」按钮：从输入端获取当前音频并刷新波形
+ *      （每次强制重新解码，解决更换输入音频后点击无效的问题）
  *
  * v8.2 修复（用户反馈）：同步按钮无法从输入的 AUDIO 加载波形
  *   根因：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），
@@ -30,7 +35,7 @@ import { $el } from "../../../scripts/ui.js";
 const NODE_TYPE = "WWDMAudioCrop";
 
 // 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.2.0";
+const WWDM_VERSION = "v8.3.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -711,12 +716,13 @@ app.registerExtension({
       this.wwdmBtnPlay = $el("button", { textContent: "▶ 播放", style: btnStyle("#2e7d54") });
       this.wwdmBtnPlay.style.flex = "1";
       this.wwdmBtnSync = $el("button", { textContent: "🔄 同步", style: btnStyle("#3d5a80") });
+      this.wwdmBtnPreload = $el("button", { textContent: "⏬ 预加载", style: btnStyle("#6a4fa3") });
       const hint = $el("div", {
-        style: { fontSize: "10px", color: "#5c6a82", flex: "2", lineHeight: "16px", textAlign: "right" },
-        textContent: "滚轮缩放 · 空白拖动平移 · 双击适配",
+        style: { fontSize: "10px", color: "#5c6a82", flex: "1.4", lineHeight: "16px", textAlign: "right" },
+        textContent: "滚轮缩放 · 拖动平移 · 双击适配",
       });
-      const btnRow = $el("div", { style: { display: "flex", gap: "8px", marginTop: "6px", alignItems: "center" } });
-      btnRow.append(this.wwdmBtnPlay, this.wwdmBtnSync, hint);
+      const btnRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "6px", alignItems: "center" } });
+      btnRow.append(this.wwdmBtnPlay, this.wwdmBtnSync, this.wwdmBtnPreload, hint);
 
       const wrap = $el("div", { style: { width: "100%", padding: "2px 0" } });
       wrap.append(uploadZone, fileRow, this.wwdmFileName, this.wwdmCanvas, inputRow, btnRow);
@@ -732,12 +738,12 @@ app.registerExtension({
         if (container) container.appendChild(wrap);
       }
 
-      // 节点高度覆盖（确保上传区/画布/输入行/播放/同步按钮全部可见；
+      // 节点高度覆盖（确保上传区/画布/输入行/播放/同步/预加载按钮全部可见；
       // 原生 start/end/duration widget 已隐藏，高度相应缩减）
       const origComputeSize = this.computeSize?.bind(this);
       this.computeSize = function (w) {
         const base = origComputeSize ? origComputeSize(w) : [360, 400];
-        const needed = 376; // 上传区(38)+下拉(30)+文件名(20)+画布(150)+输入行(52)+按钮行(36)+边距(~50)
+        const needed = 380; // 上传区(38)+下拉(30)+文件名(20)+画布(150)+输入行(52)+按钮行(38)+边距(~52)
         return [base[0], Math.max(base[1], needed)];
       };
 
@@ -775,8 +781,11 @@ app.registerExtension({
         });
       }
 
-      // ---------- 同步按钮（v8：从输入 audio 加载波形 + 同步全部） ----------
+      // ---------- 同步按钮（v8.3：只同步时间选择与手柄位置，不加载波形） ----------
       this.wwdmBtnSync.addEventListener("click", () => this._wwdmSyncAll());
+
+      // ---------- 预加载按钮（v8.3：从输入端获取当前音频并刷新波形） ----------
+      this.wwdmBtnPreload.addEventListener("click", () => this._wwdmPreload());
 
       // ---------- 播放按钮 ----------
       this.wwdmBtnPlay.addEventListener("click", () => {
@@ -945,43 +954,14 @@ app.registerExtension({
       return null;
     };
 
-    // ---------- 一键同步（v8：从输入 audio 加载波形 + 同步时间与手柄） ----------
-    nodeType.prototype._wwdmSyncAll = async function () {
+    // ---------- 同步（v8.3：只同步时间选择与手柄位置，不加载波形） ----------
+    nodeType.prototype._wwdmSyncAll = function () {
       if (!this.wwdmWc) return;
-      // 1) 解析音频源并加载波形
-      const name = this._wwdmResolveSource();
-      if (!name) {
-        alert("未找到音频：请在节点内上传音频，或连接 LoadAudio 的 AUDIO 输入");
+      if (!this.wwdmWc.hasData) {
+        alert("波形尚未加载：请先点击「⏬ 预加载」从输入音频加载波形");
         return;
       }
-      const url = makeFileUrl(name);
-      try {
-        const buffer = await decodeAudioBuffer(url);
-        const peaks = bufferToPeaks(buffer, 1200);
-        const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
-        this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
-        // 记录来源（若与当前不同，同步 UI 展示）
-        if (this._wwdmCurrentName !== name) {
-          this._wwdmCurrentName = name;
-          const wf = this.widgets?.find((x) => x.name === "audio_file");
-          if (wf) wf.value = name;
-          this.wwdmFileName.textContent = "已加载: " + name;
-          this.wwdmAudioUrl = url;
-          const sel = this.wwdmFileSelect;
-          if (sel && ![...sel.options].some((o) => o.value === name)) {
-            const opt = document.createElement("option");
-            opt.value = name;
-            opt.textContent = name;
-            sel.appendChild(opt);
-          }
-          if (sel) sel.value = name;
-        }
-      } catch (err) {
-        console.error("[wwdm] 同步加载波形失败", err);
-        alert("波形加载失败: " + String(err.message || err));
-        return;
-      }
-      // 2) 按输入行时间参数同步手柄：开始时间 / 选取时长(优先) / 结束时间
+      // 按输入行时间参数同步手柄：开始时间 / 选取时长(优先) / 结束时间
       const { sv, ev, dv } = this._wwdmReadInputs();
       const dur = this.wwdmWc.duration;
       let s = 0, e = dur;
@@ -994,6 +974,47 @@ app.registerExtension({
       if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
       this.wwdmWc.setSelection(s, e);
       this._wwdmSyncWidgets();
+    };
+
+    // ---------- 预加载（v8.3：从输入端获取当前音频并刷新波形，每次强制重新解码） ----------
+    nodeType.prototype._wwdmPreload = async function () {
+      if (!this.wwdmWc) return;
+      const name = this._wwdmResolveSource();
+      if (!name) {
+        alert("未找到音频：请在节点内上传音频，或连接 LoadAudio 的 AUDIO 输入");
+        return;
+      }
+      const url = makeFileUrl(name);
+      try {
+        this.wwdmCanvas.style.opacity = "0.45";
+        const buffer = await decodeAudioBuffer(url);
+        const peaks = bufferToPeaks(buffer, 1200);
+        const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
+        this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
+        this.wwdmCanvas.style.opacity = "1";
+        // 更新来源展示（强制刷新：即使同名也刷新 UI，解决更换输入音频后点击无效）
+        this._wwdmCurrentName = name;
+        const wf = this.widgets?.find((x) => x.name === "audio_file");
+        if (wf) wf.value = name;
+        this.wwdmFileName.textContent = "已加载: " + name;
+        this.wwdmAudioUrl = url;
+        const sel = this.wwdmFileSelect;
+        if (sel && ![...sel.options].some((o) => o.value === name)) {
+          const opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = name;
+          sel.appendChild(opt);
+        }
+        if (sel) sel.value = name;
+        // 波形刷新后：选区重置为全选，并同步到输入行
+        this.wwdmWc.setSelection(0, duration);
+        this._wwdmSyncWidgets();
+      } catch (err) {
+        console.error("[wwdm] 预加载波形失败", err);
+        this.wwdmCanvas.style.opacity = "1";
+        this.wwdmFileName.textContent = "❌ 波形加载失败: " + String(err.message || err);
+        alert("波形加载失败: " + String(err.message || err));
+      }
     };
 
     // ---------- 选区 → 节点参数 + 输入框 同步 ----------
