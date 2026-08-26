@@ -93,7 +93,6 @@ function makeFileUrl(name) {
   const path = "/view?" + params.toString();
   return typeof api.apiURL === "function" ? api.apiURL(path) : path;
 }
-}
 
 // =====================================================================
 // =====================================================================
