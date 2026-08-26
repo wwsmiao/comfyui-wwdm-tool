@@ -7,7 +7,7 @@ WWDMAudioCrop 节点 —— 音频可视化裁剪（v4，节点内上传）
     - 剪辑式交互：开始/结束手柄、播放按钮、时间输入、时长联动
 
 输入参数：
-    audio      - 可选 AUDIO 输入（兼容旧工作流；与 audio_file 二选一，优先 audio_file）
+    audio      - 可选 AUDIO 输入（兼容 dict/对象/tensor 多种结构，视频节点输出也可用）
     audio_file - 节点内上传的音频文件名（input 目录，含 subfolder），隐藏 widget
     start_time - 开始时间（秒）
     end_time   - 结束时间（秒，0 = 音频末尾）
@@ -249,8 +249,12 @@ class WWDMAudioCrop:
         try:
             key = str(audio_file or "")
             if audio is not None:
-                wf = audio["waveform"]
-                key += f"#{float(wf.shape[-1])}#{int(wf.dtype == torch.float16)}"
+                if isinstance(audio, dict):
+                    wf = audio.get("waveform")
+                else:
+                    wf = audio.waveform
+                if wf is not None:
+                    key += f"#{float(wf.shape[-1])}#{int(wf.dtype == torch.float16)}"
             return key
         except Exception:
             return float("nan")
@@ -264,8 +268,29 @@ class WWDMAudioCrop:
             wav2d, sample_rate = load_audio_file(path)
             waveform = wav2d.unsqueeze(0)  # [C,L] -> [1,C,L]
         elif audio is not None:
-            waveform = audio["waveform"]
-            sample_rate = int(audio["sample_rate"])
+            # 兼容多种音频输入结构：
+            #   {"waveform": tensor, "sample_rate": int}   LoadAudio / 音频节点
+            #   对象属性（.waveform / .sample_rate）          部分视频/音频节点
+            #   tensor 本体（[B,C,L] 或 [C,L]）               部分视频节点提取的音频
+            if isinstance(audio, dict):
+                waveform = audio.get("waveform")
+                sample_rate = audio.get("sample_rate")
+            elif hasattr(audio, "waveform") and hasattr(audio, "sample_rate"):
+                waveform = audio.waveform
+                sample_rate = audio.sample_rate
+            elif isinstance(audio, torch.Tensor):
+                waveform = audio
+            else:
+                raise ValueError(
+                    "WWDMAudioCrop: 无法识别的音频输入类型 %s，请使用 LoadAudio 或上传文件"
+                    % type(audio).__name__
+                )
+            if waveform is None:
+                raise ValueError("WWDMAudioCrop: 音频输入缺少 waveform 数据")
+            if sample_rate is None:
+                sample_rate = 44100
+            if waveform.ndim == 2:
+                waveform = waveform.unsqueeze(0)  # [C,L] -> [1,C,L]
         else:
             raise ValueError("WWDMAudioCrop: 请在节点内上传音频文件，或连接 AUDIO 输入")
 

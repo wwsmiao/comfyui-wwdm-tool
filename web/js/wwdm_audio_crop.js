@@ -1,46 +1,39 @@
 /**
- * WWDMAudioCrop —— 音频裁剪节点前端（v8.6）
+ * WWDMAudioCrop —— 音频裁剪节点前端（v8.7）
+ *
+ * v8.7 优化（用户需求）：
+ *   1. 去除「🔄 同步」按钮（保留预加载 / 播放）
+ *   2. 开始/结束时间秒数保留整数；选取时长用整数下拉，范围 1-15 秒
+ *   3. 解决视频节点音频输出无法预加载的问题：
+ *      - 新增后端 GET /wwdm/audio/resolve 路由：相对/绝对路径/视频文件统一
+ *        folder_paths 定位 + PyAV 解码拿时长 + 转码 wav 返回可播放 URL
+ *      - 前端 _wwdmResolveSourceInfo 扩展：兼容上游任意 AUDIO/视频输出节点
+ *        （widget 值、对象属性、tensor 直传），不再限定 LoadAudio
+ *   4. 开始/结束时间的时、分、秒分开使用下拉菜单选择
+ *      （开始：时/分/秒 3 个下拉；结束：时/分/秒 3 个下拉；时长：1 个下拉）
  *
  * v8.6 重构（用户需求）：去掉波形面板，时间选择改为下拉方式
  *   1. 移除波形画布（WaveCanvas/双手柄/缩放平移/波形渲染全部删除）
- *   2. 开始/结束/时长三个输入框改为下拉选择，粒度按音频时长自适应：
- *      ≤60s → 每 1s 一档；≤10min → 每 30s 一档；>10min → 每 60s 一档
+ *   2. 时间选择改下拉，粒度按音频时长自适应（≤60s 每1s / ≤10min 每30s / >10min 每60s）
  *   3. 保留：上传区、已上传列表下拉、播放/同步/预加载按钮、audio_file 隐藏 widget
- *   4. 时间状态存 _wwdmSel（{s,e}），经隐藏 widget start_time/end_time/duration 传后端
  *
  * v8.5 已回退（用户反馈波形面板和按钮消失）：DOM widget 高度自适应方案失败
  *
  * v8.4 修复（用户反馈）：更换输入音频后再点预加载，跳回第一次选择的音频
- *   根因：预加载把上游 LoadAudio 解析到的文件名写入了 audio_file widget，
- *   而解析源优先读 widget → widget 被固化旧音频。
- *   修复：解析源区分来源（_wwdmResolveSourceInfo 返回 fromUpload 标记）；
- *   仅节点内上传才写 audio_file widget，上游 LoadAudio 来源写空保持实时读取。
+ *   根因：预加载把上游解析到的文件名写入了 audio_file widget，而解析源优先读
+ *   widget → widget 被固化旧音频。修复：仅节点内上传才写 widget，上游来源写空。
  *
- * v8.3 优化（用户需求）：同步/预加载功能分离
- *   1. 「🔄 同步」按钮只同步时间选择与手柄位置（不加载波形）
- *   2. 新增「⏬ 预加载」按钮：从输入端获取当前音频并刷新波形
+ * v8.3 优化：同步/预加载功能分离（同步只同步时间，预加载加载音频）
  *
- * v8.2 修复（用户反馈）：同步按钮无法从输入的 AUDIO 加载波形
- *   根因：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），
- *   _wwdmResolveSource 用 links.find() 直接 TypeError，同步中断。
- *   修复：兼容 Map（.get）与数组（.find）两种结构。
+ * v8.2 修复：新版 ComfyUI app.graph.links 是 Map（旧版数组），.find() 兼容
  *
- * v8.1 优化（用户反馈）：
- *   1. 输出只保留裁剪后的 audio 音频（去掉 start/end/duration/preview 输出）
- *   2. 修复结束手柄无法拖动：手柄命中判定改为纯像素距离（不依赖选区时间
- *      区间 isSel），避免结束手柄在音频末尾时鼠标落点在手柄右侧导致
- *      判定失败落入画布平移；拖动改为偏移量方式精确跟随指针
+ * v8.1 优化：输出只保留裁剪 audio；修复结束手柄无法拖动（像素距离判定+偏移拖动）
  *
- * v8 优化（用户需求）：
- *   1. 去掉节点上半部分的 start_time/end_time/duration 原生参数 widget
- *      （前端隐藏，视觉上消失）；保留波形下方的「开始时间/结束时间/选取时长」
- *      输入框 + audio_file 上传功能。隐藏 widget 仍序列化，执行时正常传参。
- *   2. 「🔄 同步」按钮功能改为：从输入的 audio 加载波形（优先节点内上传的
- *      audio_file，其次上游 LoadAudio 节点），同时同步开始时间、结束时间、
- *      选取时长和波形手柄位置。
+ * v8 优化：隐藏节点上半部分原生参数 widget，保留波形下方输入 + audio_file 上传
  *
- * 架构（沿用 v4-v7）：
+ * 架构：
  *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码 → 下拉选时间
+ *   预加载 → _wwdmResolveSourceInfo 找音频源 → GET /wwdm/audio/resolve → 时长+URL
  */
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
@@ -48,8 +41,8 @@ import { $el } from "../../../scripts/ui.js";
 
 const NODE_TYPE = "WWDMAudioCrop";
 
-// 插件版本号（每次更新递增；显示在节点头部，便于确认是否最新版）
-const WWDM_VERSION = "v8.6.0";
+// 插件版本号（每次更新递增；显示在按钮行右侧，便于确认是否最新版）
+const WWDM_VERSION = "v8.7.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -57,47 +50,41 @@ function normalizeUrl(url) {
   return api.apiURL(url.replace(/^\/+/, ""));
 }
 
-// ---------- 时间格式工具（hh:mm:ss + 一位小数秒）----------
-/** 解析 "hh:mm:ss.s" / "mm:ss.s" / "ss.s" / 纯数字秒 → 秒数；解析失败返回 null */
+// ---------- 时间格式工具（整数秒） ----------
+/** 解析 "hh:mm:ss" / "mm:ss" / "ss" / 纯数字秒 → 整数秒；解析失败返回 null */
 function parseTime(v) {
   if (v == null) return null;
   const s = String(v).trim();
   if (!s) return null;
-  if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s); // 纯秒
+  if (/^\d+(\.\d+)?$/.test(s)) return Math.round(parseFloat(s)); // 纯秒 → 取整
   const m = s.match(/^(\d{1,3}):(\d{1,2}):(\d{1,2})(?:\.(\d+))?$/); // hh:mm:ss(.s)
   if (m) {
     const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10), ss = parseInt(m[3], 10);
     if (mm >= 60 || ss >= 60) return null;
-    const frac = m[4] ? parseFloat("0." + m[4]) : 0;
-    return hh * 3600 + mm * 60 + ss + frac;
+    return hh * 3600 + mm * 60 + ss;
   }
   const m2 = s.match(/^(\d{1,3}):(\d{1,2})(?:\.(\d+))?$/); // mm:ss(.s)
   if (m2) {
     const mm = parseInt(m2[1], 10), ss = parseInt(m2[2], 10);
     if (ss >= 60) return null;
-    const frac = m2[3] ? parseFloat("0." + m2[3]) : 0;
-    return mm * 60 + ss + frac;
+    return mm * 60 + ss;
   }
   const f = parseFloat(s);
-  return isFinite(f) && f >= 0 ? f : null;
+  return isFinite(f) && f >= 0 ? Math.round(f) : null;
 }
-/** 秒 → "hh:mm:ss.s"（秒始终保留 1 位小数） */
+/** 秒 → "hh:mm:ss"（整数秒，无小数） */
 function fmtHMS(t) {
   if (!isFinite(t) || t < 0) t = 0;
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t - h * 3600) / 60);
-  const s = t - h * 3600 - m * 60;
+  const sec = Math.round(t);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec - h * 3600) / 60);
+  const s = sec - h * 3600 - m * 60;
   const pad = (n) => String(n).padStart(2, "0");
-  const ss = s.toFixed(1);
-  const [ssi, ssf] = ss.split(".");
-  return `${pad(h)}:${pad(m)}:${pad(ssi)}.${ssf}`;
-}
-/** 秒 → 保留 1 位小数的数字字符串（duration/选取时长用） */
-function fmtSec1(t) {
-  if (!isFinite(t) || t < 0) t = 0;
-  return t.toFixed(1);
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+
+// 构造 input 目录文件的 /view 播放 URL（含 subfolder）
 function makeFileUrl(name) {
   if (!name) return "";
   const parts = String(name).replaceAll("\\", "/").split("/").filter(Boolean);
@@ -106,46 +93,51 @@ function makeFileUrl(name) {
   const path = "/view?" + params.toString();
   return typeof api.apiURL === "function" ? api.apiURL(path) : path;
 }
+}
 
 // =====================================================================
-// 时间下拉选项生成（混合粒度：短音频细档 + 长音频粗档）
 // =====================================================================
-/** 根据音频时长生成时间档位列表（秒）。
- *  ≤60s → 每 1s 一档（细）
- *  ≤10min → 每 30s 一档（中）
- *  >10min → 每 60s 一档（粗）
- *  始终包含 0 与音频总时长（对齐到档位）。 */
-function timeSteps(duration) {
-  const dur = Math.max(0, duration || 0);
-  const step = dur <= 60 ? 1 : dur <= 600 ? 30 : 60;
+// 时间下拉选项生成（v8.7：整数秒）
+// =====================================================================
+/** 0..floor(dur) 的整数秒列表（步长 1，保证每个整数秒可选） */
+function intSteps(duration) {
+  const dur = Math.max(0, Math.floor(duration || 0));
   const steps = [];
-  for (let t = 0; t < dur; t += step) steps.push(t);
-  steps.push(dur); // 总时长（对齐到档位的最后值）
+  for (let t = 0; t <= dur; t++) steps.push(t);
   return steps;
 }
 
-/** 填充下拉框选项：时间为 hh:mm:ss.s 格式；value 存原始秒数。 */
-function fillTimeSelect(sel, duration, current) {
+/** 填充「时/分/秒」下拉：value 存原始数字，text 两位补零 */
+function fillHMSSelect(sel, max, current) {
   if (!sel) return;
-  const steps = timeSteps(duration);
-  const cur = current == null ? null : Number(current);
   sel.innerHTML = "";
-  // 精确匹配优先，否则选最接近的档位（向下取整，避免超过当前值）
-  let best = 0;
+  const cur = current == null ? null : Math.max(0, Math.round(Number(current)));
   let bestIdx = 0;
-  for (const t of steps) {
-    if (cur != null && Math.abs(t - cur) < 1e-6) bestIdx = steps.indexOf(t);
-    else if (cur != null && t <= cur + 1e-6) { best = t; bestIdx = steps.indexOf(t); }
+  for (let v = 0; v <= max; v++) {
     const opt = document.createElement("option");
-    opt.value = String(t);
-    opt.textContent = fmtHMS(t);
+    opt.value = String(v);
+    opt.textContent = String(v).padStart(2, "0");
     sel.appendChild(opt);
+    if (cur != null && v <= cur) bestIdx = v;
   }
-  sel.selectedIndex = bestIdx;
+  sel.selectedIndex = Math.min(bestIdx, sel.options.length - 1);
 }
 
-// =====================================================================
-// 前端解码工具
+/** 填充「选取时长」下拉：1-15 整数秒 */
+function fillDurSelect(sel, current) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  const cur = current == null ? null : Math.max(1, Math.min(15, Math.round(Number(current))));
+  for (let v = 1; v <= 15; v++) {
+    const opt = document.createElement("option");
+    opt.value = String(v);
+    opt.textContent = v + " 秒";
+    sel.appendChild(opt);
+  }
+  if (cur != null && cur >= 1 && cur <= 15) sel.value = String(cur);
+}
+
+
 // =====================================================================
 async function decodeAudioBuffer(url) {
   const response = await fetch(url);
@@ -249,7 +241,7 @@ app.registerExtension({
         },
       });
 
-      // ---------- 时间下拉行（v8.6：开始/结束/时长，混合粒度） ----------
+      // ---------- 时间下拉行（v8.7：时分秒分开 + 时长 1-15 整数） ----------
       const selStyle = {
         width: "100%",
         background: "#0f1622",
@@ -277,14 +269,31 @@ app.registerExtension({
         this[ref] = sel;
         return lab;
       };
-      const timeRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } });
-      timeRow.append(
-        mkSel("开始时间", "wwdmSelStart"),
-        mkSel("结束时间", "wwdmSelEnd"),
-        mkSel("选取时长", "wwdmSelDur")
+      // 开始时间：时/分/秒 三个下拉
+      const startRow = $el("div", { style: { display: "flex", gap: "4px", marginTop: "6px", alignItems: "flex-end" } });
+      const sLab = $el("span", { style: { fontSize: "11px", color: "#8fa0b8", marginRight: "4px", lineHeight: "22px" }, textContent: "开始" });
+      startRow.append(sLab);
+      startRow.append(
+        mkSel("时", "wwdmSelSH"),
+        mkSel("分", "wwdmSelSM"),
+        mkSel("秒", "wwdmSelSS")
       );
+      // 结束时间：时/分/秒 三个下拉
+      const endRow = $el("div", { style: { display: "flex", gap: "4px", marginTop: "4px", alignItems: "flex-end" } });
+      const eLab = $el("span", { style: { fontSize: "11px", color: "#8fa0b8", marginRight: "4px", lineHeight: "22px" }, textContent: "结束" });
+      endRow.append(eLab);
+      endRow.append(
+        mkSel("时", "wwdmSelEH"),
+        mkSel("分", "wwdmSelEM"),
+        mkSel("秒", "wwdmSelES")
+      );
+      // 选取时长：1-15 整数秒
+      const durRow = $el("div", { style: { display: "flex", gap: "4px", marginTop: "4px", alignItems: "flex-end" } });
+      const dLab = $el("span", { style: { fontSize: "11px", color: "#8fa0b8", marginRight: "4px", lineHeight: "22px" }, textContent: "时长" });
+      durRow.append(dLab);
+      durRow.append(mkSel("选取时长", "wwdmSelDur"));
 
-      // ---------- 按钮行（播放 + 同步 + 预加载） ----------
+      // ---------- 按钮行（v8.7：播放 + 预加载，已去掉同步） ----------
       const btnStyle = (bg) => ({
         background: bg,
         color: "#fff",
@@ -297,35 +306,35 @@ app.registerExtension({
       });
       this.wwdmBtnPlay = $el("button", { textContent: "▶ 播放", style: btnStyle("#2e7d54") });
       this.wwdmBtnPlay.style.flex = "1";
-      this.wwdmBtnSync = $el("button", { textContent: "🔄 同步", style: btnStyle("#3d5a80") });
       this.wwdmBtnPreload = $el("button", { textContent: "⏬ 预加载", style: btnStyle("#6a4fa3") });
+      this.wwdmBtnPreload.style.flex = "1";
       const hint = $el("div", {
-        style: { fontSize: "10px", color: "#5c6a82", flex: "1.2", lineHeight: "16px", textAlign: "right" },
+        style: { fontSize: "10px", color: "#5c6a82", flex: "1.4", lineHeight: "16px", textAlign: "right" },
         textContent: "版本 " + WWDM_VERSION,
       });
       const btnRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "6px", alignItems: "center" } });
-      btnRow.append(this.wwdmBtnPlay, this.wwdmBtnSync, this.wwdmBtnPreload, hint);
+      btnRow.append(this.wwdmBtnPlay, this.wwdmBtnPreload, hint);
 
       const wrap = $el("div", { style: { width: "100%", padding: "2px 0" } });
-      wrap.append(uploadZone, this.wwdmFileSelect, this.wwdmFileName, timeRow, btnRow);
+      wrap.append(uploadZone, this.wwdmFileSelect, this.wwdmFileName, startRow, endRow, durRow, btnRow);
       this.wwdmUiEl = wrap;
 
       if (this.addDOMWidget) {
         this.wwdmWidget = this.addDOMWidget("wwdm_ui", "wwdm_ui", wrap, { serialize: false });
-        // v8.6：无波形画布，内容更紧凑。固定高度（上传区34+下拉30+文件名16+时间行52+按钮行30+边距≈20 ≈ 182）
+        // v8.7：无画布，时分秒 3 行 + 按钮行。固定高度（上传34+下拉30+文件名16+开始28+结束28+时长28+按钮30+边距≈40）
         this.wwdmWidget.computeSize = function (width) {
-          return [width || 320, 185];
+          return [width || 340, 245];
         };
       } else {
         const container = this.el || this.nodeEl || this.constructor?.nodeEl;
         if (container) container.appendChild(wrap);
       }
 
-      // 节点高度覆盖（v8.6：无画布，内容紧凑）
+      // 节点高度覆盖（v8.7：无画布，内容紧凑）
       const origComputeSize = this.computeSize?.bind(this);
       this.computeSize = function (w) {
-        const base = origComputeSize ? origComputeSize(w) : [360, 300];
-        const needed = 240; // 上传区(34)+下拉(30)+文件名(16)+时间行(52)+按钮行(30)+边距(~78)
+        const base = origComputeSize ? origComputeSize(w) : [360, 320];
+        const needed = 300; // 上传34+下拉30+文件名16+时间3行(84)+按钮30+边距(~100)
         return [base[0], Math.max(base[1], needed)];
       };
 
@@ -346,29 +355,33 @@ app.registerExtension({
       this._wwdmDuration = 0;
       this._wwdmAudioUrl = "";
       this._wwdmHasAudio = false;
-      // ---------- 时间下拉事件（v8.6） ----------
+      // ---------- 时间下拉事件（v8.7：时分秒 + 时长联动） ----------
+      // 从 7 个下拉读取时间：开始 = SH*3600+SM*60+SS；结束 = EH*3600+EM*60+ES
+      this._wwdmReadSel = () => {
+        const g = (ref) => { const el = this[ref]; return el && el.value !== "" ? Number(el.value) : 0; };
+        const sv = g("wwdmSelSH") * 3600 + g("wwdmSelSM") * 60 + g("wwdmSelSS");
+        const ev = g("wwdmSelEH") * 3600 + g("wwdmSelEM") * 60 + g("wwdmSelES");
+        const dv = g("wwdmSelDur");
+        return { sv, ev, dv };
+      };
       const applyFromDropdowns = () => {
         if (!this._wwdmHasAudio) return;
         const dur = this._wwdmDuration || 1;
-        const sv = this.wwdmSelStart.value ? Number(this.wwdmSelStart.value) : 0;
-        const ev = this.wwdmSelEnd.value ? Number(this.wwdmSelEnd.value) : dur;
-        const dv = this.wwdmSelDur.value ? Number(this.wwdmSelDur.value) : 0;
+        const { sv, ev, dv } = this._wwdmReadSel();
         let s = Math.max(0, Math.min(sv, dur));
         let e;
         if (dv != null && dv > 0) {
           e = Math.min(dur, s + dv); // 时长优先
         } else {
-          e = Math.min(dur, Math.max(ev, s + 0.01));
+          e = Math.min(dur, Math.max(ev, s + 1));
         }
-        if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
+        if (e <= s + 1) e = Math.min(dur, s + 1);
         this._setSel(s, e);
       };
-      this.wwdmSelStart.addEventListener("change", applyFromDropdowns);
-      this.wwdmSelEnd.addEventListener("change", applyFromDropdowns);
-      this.wwdmSelDur.addEventListener("change", applyFromDropdowns);
-
-      // ---------- 同步按钮（v8.3：只同步时间选择，不加载波形） ----------
-      this.wwdmBtnSync.addEventListener("click", () => this._wwdmSyncAll());
+      for (const ref of ["wwdmSelSH", "wwdmSelSM", "wwdmSelSS", "wwdmSelEH", "wwdmSelEM", "wwdmSelES", "wwdmSelDur"]) {
+        const el = this[ref];
+        if (el) el.addEventListener("change", applyFromDropdowns);
+      }
 
       // ---------- 预加载按钮（v8.3：从输入端获取当前音频并刷新） ----------
       this.wwdmBtnPreload.addEventListener("click", () => this._wwdmPreload());
@@ -391,7 +404,7 @@ app.registerExtension({
         }
       });
 
-      // ---------- 上传处理 ----------
+
       this._wwdmUpload = async (file) => {
         if (!file) return;
         this.wwdmUploadZone.textContent = "⏳ 上传中…";
@@ -484,30 +497,40 @@ app.registerExtension({
       return r;
     };
 
-    // ---------- 设置选区（v8.6：核心状态入口） ----------
-    // 写 _wwdmSel、刷新三个时间下拉、写隐藏 widget（start_time/end_time/duration）
+    // ---------- 设置选区（v8.7：核心状态入口） ----------
+    // 写 _wwdmSel、刷新 7 个下拉、写隐藏 widget（start_time/end_time/duration）
     nodeType.prototype._setSel = function (s, e) {
       const dur = this._wwdmDuration || 0;
       if (dur <= 0) return;
-      s = Math.max(0, Math.min(s, dur));
-      e = Math.max(s, Math.min(e, dur));
+      s = Math.max(0, Math.min(Math.round(s), Math.floor(dur)));
+      e = Math.max(s + 1, Math.min(Math.round(e), Math.floor(dur)));
       this._wwdmSel = { s, e };
-      // 刷新下拉（保持当前选择，若档位不同则就近对齐）
-      fillTimeSelect(this.wwdmSelStart, dur, s);
-      fillTimeSelect(this.wwdmSelEnd, dur, e);
-      fillTimeSelect(this.wwdmSelDur, dur, e - s);
+      // 刷新时分秒下拉（时 0-23 / 分 0-59 / 秒 0-59；若音频超 24h 则时上限扩展）
+      const maxH = Math.min(23, Math.floor(dur / 3600));
+      const sSec = s % 60, sMin = Math.floor(s / 60) % 60, sHr = Math.floor(s / 3600);
+      const eSec = e % 60, eMin = Math.floor(e / 60) % 60, eHr = Math.floor(e / 3600);
+      fillHMSSelect(this.wwdmSelSH, maxH, sHr);
+      fillHMSSelect(this.wwdmSelSM, 59, sMin);
+      fillHMSSelect(this.wwdmSelSS, 59, sSec);
+      fillHMSSelect(this.wwdmSelEH, maxH, eHr);
+      fillHMSSelect(this.wwdmSelEM, 59, eMin);
+      fillHMSSelect(this.wwdmSelES, 59, eSec);
+      fillDurSelect(this.wwdmSelDur, e - s);
       this._wwdmSyncWidgets();
     };
 
-    // ---------- 解析音频源（返回 {name, fromUpload}：fromUpload=true 表示节点内上传） ----------
+
+    // ---------- 解析音频源（v8.7：返回 {name, fromUpload}） ----------
+    // fromUpload=true 表示节点内上传（文件名存 input 目录）
+    // 否则为上游节点来源：widget 值（LoadAudio/视频节点路径），或对象/字典属性
     nodeType.prototype._wwdmResolveSourceInfo = function () {
       // 1) 节点内上传的 audio_file
       const wf = this.widgets?.find((x) => x.name === "audio_file");
       if (wf?.value && String(wf.value).trim()) {
         return { name: String(wf.value).trim(), fromUpload: true };
       }
-      // 2) 上游 LoadAudio 节点的音频文件名
-      //    注意：新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），需兼容两种结构
+      // 2) 上游节点的音频文件名（LoadAudio / 视频节点 / 任意 AUDIO 输出）
+      //    新版 ComfyUI 的 app.graph.links 是 Map（旧版是数组），需兼容两种结构
       const inp = this.inputs?.find((x) => x.name === "audio");
       if (inp?.link != null && app?.graph) {
         const links = app.graph.links;
@@ -516,15 +539,32 @@ app.registerExtension({
           : links?.get?.(inp.link);
         const src = link ? app.graph.getNodeById(link.origin_id) : null;
         if (src) {
-          // LoadAudio 的 audio 参数
+          // 2a) 优先取「audio」命名 widget（LoadAudio 风格）
           const aw = src.widgets?.find((x) => x.name === "audio");
-          if (aw?.value && String(aw.value).trim()) {
+          if (aw?.value && typeof aw.value === "string" && String(aw.value).trim()) {
             return { name: String(aw.value).trim(), fromUpload: false };
           }
-          // 兼容：第一个 widget 恰好是文件名的场景
+          // 2b) 视频节点：widget 可能是 video/file/audio_file/audio_path/filename 等路径
+          for (const nm of ["video", "file", "audio_file", "audio_path", "filename"]) {
+            const wv = src.widgets?.find((x) => x.name === nm);
+            if (wv?.value && typeof wv.value === "string" && String(wv.value).trim()) {
+              return { name: String(wv.value).trim(), fromUpload: false };
+            }
+          }
+          // 2c) 兼容：第一个 widget 恰好是文件名的场景（含 combo/字符串）
           const w0 = src.widgets?.[0];
           if (w0?.value && typeof w0.value === "string" && String(w0.value).trim()) {
             return { name: String(w0.value).trim(), fromUpload: false };
+          }
+          // 2d) 对象/字典属性（部分自定义节点输出 audio 对象）
+          const ww = src.widgetsValues || src.properties || null;
+          if (ww && typeof ww === "object") {
+            for (const k of ["audio", "video", "file", "filename", "path"]) {
+              const v = ww[k];
+              if (v && typeof v === "string" && String(v).trim()) {
+                return { name: String(v).trim(), fromUpload: false };
+              }
+            }
           }
         }
       }
@@ -537,43 +577,27 @@ app.registerExtension({
       return info ? info.name : null;
     };
 
-    // ---------- 同步（v8.3：只同步时间选择，不加载音频） ----------
-    // v8.6：从三个下拉读取开始/结束/时长，重算选区（时长优先）
-    nodeType.prototype._wwdmSyncAll = function () {
-      if (!this._wwdmHasAudio) {
-        alert("音频尚未加载：请先点「⏬ 预加载」或上传音频");
-        return;
-      }
-      const dur = this._wwdmDuration || 1;
-      const sv = this.wwdmSelStart.value ? Number(this.wwdmSelStart.value) : 0;
-      const ev = this.wwdmSelEnd.value ? Number(this.wwdmSelEnd.value) : dur;
-      const dv = this.wwdmSelDur.value ? Number(this.wwdmSelDur.value) : 0;
-      let s = Math.max(0, Math.min(sv, dur));
-      let e;
-      if (dv != null && dv > 0) {
-        e = Math.min(dur, s + dv); // 时长优先
-      } else {
-        e = Math.min(dur, Math.max(ev, s + 0.01));
-      }
-      if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
-      this._setSel(s, e);
-    };
-
-    // ---------- 预加载（v8.4：从输入端获取当前音频，每次强制重新解码） ----------
+    // ---------- 预加载（v8.7：后端 /wwdm/audio/resolve 解析任意来源） ----------
+    // 支持：节点内上传 / LoadAudio / 视频节点路径 / 绝对路径 / 相对路径
     nodeType.prototype._wwdmPreload = async function () {
       const info = this._wwdmResolveSourceInfo();
       const name = info ? info.name : null;
       if (!name) {
-        alert("未找到音频：请在节点内上传音频，或连接 LoadAudio 的 AUDIO 输入");
+        alert("未找到音频：请在节点内上传音频，或连接 LoadAudio / 视频节点的 AUDIO 输入");
         return;
       }
-      const url = makeFileUrl(name);
+      // 后端统一解析：folder_paths 定位（相对/绝对路径/视频文件均可）→ 时长 + 可播放 URL
       try {
-        const buffer = await decodeAudioBuffer(url);
-        const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
+        const res = await api.fetchApi("/wwdm/audio/resolve?name=" + encodeURIComponent(name));
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error((data && data.error) || ("HTTP " + res.status));
+        }
+        const duration = Number(data.duration) || 0;
+        if (duration <= 0) throw new Error("音频时长为 0");
         // 更新来源展示（强制刷新：即使同名也刷新 UI，解决更换输入音频后点击无效）
         this._wwdmCurrentName = name;
-        // 仅节点内上传才写入 audio_file widget；上游 LoadAudio 来源不写 widget，
+        // 仅节点内上传才写入 audio_file widget；上游来源不写 widget，
         // 保持 widget 为空 → 下次解析仍读上游当前音频（否则会固化旧音频导致跳回第一次）
         const wf = this.widgets?.find((x) => x.name === "audio_file");
         if (info.fromUpload) {
@@ -582,7 +606,7 @@ app.registerExtension({
           wf.value = "";
         }
         this.wwdmFileName.textContent = "已加载: " + name;
-        this.wwdmAudioUrl = url;
+        this.wwdmAudioUrl = data.audio_url || makeFileUrl(name);
         this._wwdmDuration = duration;
         this._wwdmHasAudio = true;
         const sel = this.wwdmFileSelect;
@@ -593,7 +617,7 @@ app.registerExtension({
           sel.appendChild(opt);
         }
         if (sel) sel.value = name;
-        // 新音频：选区重置为全选，并填充时间下拉
+        // 新音频：选区重置为全选，并填充时分秒下拉
         this._setSel(0, duration);
       } catch (err) {
         console.error("[wwdm] 预加载失败", err);
@@ -602,24 +626,25 @@ app.registerExtension({
       }
     };
 
-    // ---------- 选区 → 隐藏 widget（start_time/end_time/duration）同步 ----------
+
+    // ---------- 选区 → 隐藏 widget（start_time/end_time/duration）同步（v8.7 整数） ----------
     nodeType.prototype._wwdmSyncWidgets = function () {
       if (this._wwdmGuard) return;
       this._wwdmGuard = true;
       try {
         const { s, e } = this._wwdmSel || { s: 0, e: 0 };
-        const dur = Math.max(0, e - s);
+        const dur = Math.max(1, e - s);
         const w = (name) => this.widgets?.find((x) => x.name === name);
         const ws = w("start_time"), we = w("end_time"), wd = w("duration");
         if (ws) ws.value = fmtHMS(s);
         if (we) we.value = fmtHMS(e);
-        if (wd) wd.value = fmtSec1(dur);
+        if (wd) wd.value = String(Math.round(dur));
       } finally {
         this._wwdmGuard = false;
       }
     };
 
-    // ---------- 节点参数变化 → 下拉（反向联动，一般不会触发因为 widget 已隐藏） ----------
+
     const onWidgetChanged = nodeType.prototype.onWidgetChanged;
     nodeType.prototype.onWidgetChanged = function (widget, value) {
       const r = onWidgetChanged?.apply(this, arguments);
@@ -627,13 +652,13 @@ app.registerExtension({
       if (widget?.name === "start_time") {
         const v = parseTime(value);
         if (v != null) {
-          const e = Math.max(v + 0.01, this._wwdmSel.e);
+          const e = Math.max(v + 1, this._wwdmSel.e);
           this._setSel(v, e);
         }
       } else if (widget?.name === "end_time") {
         const v = parseTime(value);
         if (v != null) {
-          const s = Math.min(v - 0.01, this._wwdmSel.s);
+          const s = Math.min(v - 1, this._wwdmSel.s);
           this._setSel(s, v);
         }
       } else if (widget?.name === "duration") {
@@ -663,7 +688,7 @@ app.registerExtension({
         let e = this._wwdmSel?.e ?? dur;
         if (sv != null && sv >= 0) s = Math.min(sv, dur);
         if (dv != null && dv > 0) e = Math.min(dur, s + dv);
-        else if (ev != null && ev > 0) e = Math.min(dur, Math.max(ev, s + 0.01));
+        else if (ev != null && ev > 0) e = Math.min(dur, Math.max(ev, s + 1));
         this._setSel(s, e);
       }
       return r;

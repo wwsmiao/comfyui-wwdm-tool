@@ -6,6 +6,8 @@ WWDMAudioCrop 服务端路由（v2）
                                 波形数据（1200 桶峰值）+ 可直接播放的 /view URL，
                                 供前端在节点未执行/无波形消息时也能即时加载波形并播放。
     POST /wwdm/audio/waveform  上传音频 → 返回波形 PNG（可选，保留）
+    GET  /wwdm/audio/files     列出 input 目录音频文件（根目录 + 一层子目录）
+    GET  /wwdm/audio/resolve   解析音频源（相对/绝对路径/视频文件）→ 时长 + 可播放 URL
     GET  /wwdm/audio/ping      健康检查
 """
 
@@ -210,6 +212,57 @@ def _register_routes():
             log.warning("列出音频文件失败: %s", exc)
         files.sort(key=str.lower)
         return _safe_json({"files": files})
+
+    @_routes.get("/wwdm/audio/resolve")
+    async def wwdm_audio_resolve(request):
+        """解析音频源（文件名/相对路径/绝对路径/视频文件）→ 时长 + 可播放 URL。
+
+        用于前端预加载：上游节点（LoadAudio 或任意 AUDIO/视频输出节点）的
+        widget 值可能是 input 相对路径（含 subfolder）、绝对路径、或视频文件。
+        统一经 folder_paths.get_annotated_filepath 定位，PyAV 解码拿时长，
+        并把音频转码保存为 wav 返回可播放 URL（视频文件也可直接播放）。
+        """
+        import time
+        import random
+
+        name = (request.query.get("name") or "").strip()
+        if not name:
+            return _safe_json({"error": "缺少 name 参数"}, 400)
+        try:
+            import folder_paths
+
+            path = folder_paths.get_annotated_filepath(name)
+        except Exception as exc:
+            log.warning("resolve 定位文件失败 %r: %s", name, exc)
+            return _safe_json({"error": f"无法定位文件: {exc}"}, 404)
+        if not os.path.isfile(path):
+            return _safe_json({"error": f"文件不存在: {path}"}, 404)
+        try:
+            waveform, sr = load_audio_file(path)
+        except Exception as exc:
+            log.warning("resolve 解码失败 %r: %s", name, exc)
+            return _safe_json({"error": f"音频解码失败: {exc}"}, 422)
+        duration = waveform.shape[1] / float(sr)
+        # 转码保存为 wav，保证可播放（视频文件浏览器 <audio> 也可播，双保险）
+        audio_url = None
+        try:
+            out_dir = os.path.join(folder_paths.get_output_directory(), "wwdm_audio_crop")
+            os.makedirs(out_dir, exist_ok=True)
+            fn = f"resolved_{int(time.time() * 1000)}_{random.randint(1000, 9999)}.wav"
+            save_wav(waveform.unsqueeze(0), sr, os.path.join(out_dir, fn))
+            audio_url = build_view_url("wwdm_audio_crop/" + fn, type_="output")
+        except Exception as exc:
+            log.warning("resolve 保存 wav 失败: %s", exc)
+        return _safe_json(
+            {
+                "ok": True,
+                "name": name,
+                "path": path,
+                "duration": duration,
+                "sample_rate": sr,
+                "audio_url": audio_url,
+            }
+        )
 
 
 try:
