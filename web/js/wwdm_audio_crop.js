@@ -1,5 +1,14 @@
 /**
- * WWDMAudioCrop —— 音频可视化裁剪节点前端（v8.4）
+ * WWDMAudioCrop —— 音频裁剪节点前端（v8.6）
+ *
+ * v8.6 重构（用户需求）：去掉波形面板，时间选择改为下拉方式
+ *   1. 移除波形画布（WaveCanvas/双手柄/缩放平移/波形渲染全部删除）
+ *   2. 开始/结束/时长三个输入框改为下拉选择，粒度按音频时长自适应：
+ *      ≤60s → 每 1s 一档；≤10min → 每 30s 一档；>10min → 每 60s 一档
+ *   3. 保留：上传区、已上传列表下拉、播放/同步/预加载按钮、audio_file 隐藏 widget
+ *   4. 时间状态存 _wwdmSel（{s,e}），经隐藏 widget start_time/end_time/duration 传后端
+ *
+ * v8.5 已回退（用户反馈波形面板和按钮消失）：DOM widget 高度自适应方案失败
  *
  * v8.4 修复（用户反馈）：更换输入音频后再点预加载，跳回第一次选择的音频
  *   根因：预加载把上游 LoadAudio 解析到的文件名写入了 audio_file widget，
@@ -31,7 +40,7 @@
  *      选取时长和波形手柄位置。
  *
  * 架构（沿用 v4-v7）：
- *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码画波形 → <audio> 播放
+ *   上传 → /upload/image → 文件名存 hidden widget audio_file → 前端解码 → 下拉选时间
  */
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
@@ -39,8 +48,8 @@ import { $el } from "../../../scripts/ui.js";
 
 const NODE_TYPE = "WWDMAudioCrop";
 
-// 插件版本号（每次更新递增；显示在波形画布左上角，便于确认是否最新版）
-const WWDM_VERSION = "v8.4.0";
+// 插件版本号（每次更新递增；显示在节点头部，便于确认是否最新版）
+const WWDM_VERSION = "v8.6.0";
 
 function normalizeUrl(url) {
   if (!url) return url;
@@ -99,424 +108,40 @@ function makeFileUrl(name) {
 }
 
 // =====================================================================
-// WaveCanvas —— 波形画布（双手柄 + 缩放平移）
+// 时间下拉选项生成（混合粒度：短音频细档 + 长音频粗档）
 // =====================================================================
-class WaveCanvas {
-  constructor(canvas, opts = {}) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
-    this.opts = opts;
+/** 根据音频时长生成时间档位列表（秒）。
+ *  ≤60s → 每 1s 一档（细）
+ *  ≤10min → 每 30s 一档（中）
+ *  >10min → 每 60s 一档（粗）
+ *  始终包含 0 与音频总时长（对齐到档位）。 */
+function timeSteps(duration) {
+  const dur = Math.max(0, duration || 0);
+  const step = dur <= 60 ? 1 : dur <= 600 ? 30 : 60;
+  const steps = [];
+  for (let t = 0; t < dur; t += step) steps.push(t);
+  steps.push(dur); // 总时长（对齐到档位的最后值）
+  return steps;
+}
 
-    this.peaks = null;
-    this.sampleRate = 44100;
-    this.duration = 0;
-
-    this.viewStart = 0;
-    this.viewEnd = 0;
-    this.selStart = 0;
-    this.selEnd = 0;
-
-    this.dragging = null; // 'left' | 'right' | 'sel' | 'view'
-    this.dragStartX = 0;
-    this.dragStartView = 0;
-    this.dragStartSel = null;
-    this.pointerId = null;
-
-    this.audio = null;
-    this.playing = false;
-    this.playRaf = null;
-    this.audioUrl = null;
-
-    this._bound = {
-      move: (e) => this._onMove(e),
-      up: (e) => this._onUp(e),
-      cancel: (e) => this._onUp(e),
-    };
-    this._bind();
+/** 填充下拉框选项：时间为 hh:mm:ss.s 格式；value 存原始秒数。 */
+function fillTimeSelect(sel, duration, current) {
+  if (!sel) return;
+  const steps = timeSteps(duration);
+  const cur = current == null ? null : Number(current);
+  sel.innerHTML = "";
+  // 精确匹配优先，否则选最接近的档位（向下取整，避免超过当前值）
+  let best = 0;
+  let bestIdx = 0;
+  for (const t of steps) {
+    if (cur != null && Math.abs(t - cur) < 1e-6) bestIdx = steps.indexOf(t);
+    else if (cur != null && t <= cur + 1e-6) { best = t; bestIdx = steps.indexOf(t); }
+    const opt = document.createElement("option");
+    opt.value = String(t);
+    opt.textContent = fmtHMS(t);
+    sel.appendChild(opt);
   }
-
-  // ---------------------------------------------------------- 数据
-  setData(peaks, sampleRate, duration) {
-    this.peaks = Float32Array.from(peaks || []);
-    this.sampleRate = sampleRate || 44100;
-    this.duration = duration || (this.peaks.length ? this.peaks.length : 0);
-    if (this.duration > 0 && this.viewEnd <= this.viewStart) {
-      this.viewStart = 0;
-      this.viewEnd = this.duration;
-      if (this.selEnd <= this.selStart) this.selEnd = this.duration;
-    }
-    this.render();
-    if (this.opts.onSelection) this.opts.onSelection();
-  }
-  get hasData() {
-    return !!this.peaks && this.peaks.length > 0 && this.duration > 0;
-  }
-
-  // ---------------------------------------------------------- 选区
-  setSelection(s, e, silent) {
-    const dur = this.duration || 1;
-    this.selStart = Math.max(0, Math.min(s, dur));
-    this.selEnd = Math.max(this.selStart, Math.min(e, dur));
-    this.render();
-    if (!silent && this.opts.onSelection) this.opts.onSelection();
-  }
-  get selection() {
-    return { start: this.selStart, end: this.selEnd };
-  }
-  setDuration(d, silent) {
-    const dur = this.duration || 1;
-    const end = Math.min(this.selStart + Math.max(0, d), dur);
-    this.setSelection(this.selStart, end, silent);
-  }
-
-  // ---------------------------------------------------------- 视图
-  fitAll() {
-    this.viewStart = 0;
-    this.viewEnd = this.duration || 1;
-    this.render();
-  }
-  fitSelection() {
-    if (!this.hasData) return;
-    let pad = (this.selEnd - this.selStart) * 0.15;
-    if (pad <= 0) pad = this.duration * 0.05 || 1;
-    this.viewStart = Math.max(0, this.selStart - pad);
-    this.viewEnd = Math.min(this.duration, this.selEnd + pad);
-    this.render();
-  }
-  _xToTime(x) {
-    const w = this.canvas.clientWidth || this.canvas.width;
-    if (w <= 0) return 0;
-    return this.viewStart + (x / w) * (this.viewEnd - this.viewStart);
-  }
-  _timeToX(t) {
-    const w = this.canvas.clientWidth || this.canvas.width;
-    if (w <= 0) return 0;
-    return ((t - this.viewStart) / Math.max(1e-6, this.viewEnd - this.viewStart)) * w;
-  }
-  zoomBy(factor, centerX) {
-    if (!this.hasData) return;
-    const w = this.canvas.clientWidth || this.canvas.width;
-    const c = this._xToTime(centerX || w / 2);
-    let span = (this.viewEnd - this.viewStart) / factor;
-    span = Math.max(0.05, Math.min(span, this.duration || 1));
-    this.viewStart = Math.max(0, c - span / 2);
-    this.viewEnd = Math.min(this.duration, c + span / 2);
-    if (this.viewEnd - this.viewStart < span * 0.99) {
-      this.viewStart = Math.max(0, this.viewEnd - span);
-    }
-    this.render();
-  }
-  panBy(dxPx) {
-    if (!this.hasData) return;
-    const w = this.canvas.clientWidth || this.canvas.width;
-    const dt = (-dxPx / w) * (this.viewEnd - this.viewStart);
-    const span = this.viewEnd - this.viewStart;
-    let s = this.viewStart + dt;
-    s = Math.max(0, Math.min(s, Math.max(0, this.duration - span)));
-    this.viewStart = s;
-    this.viewEnd = s + span;
-    this.render();
-  }
-
-  // ---------------------------------------------------------- 播放
-  /** 从 from 播放到 to（固定：起点=开始手柄，终点=结束手柄） */
-  playRange(from, to, url) {
-    if (!url || !this.hasData) return;
-    this.stop();
-    this.audioUrl = url;
-    const audio = new Audio(url);
-    this.audio = audio;
-    this.audioEndTime = Math.max(from, Math.min(to, this.duration));
-    this.playing = true;
-
-    const startPlay = () => {
-      try {
-        audio.currentTime = Math.max(0, Math.min(from, this.duration));
-      } catch (e) {}
-      audio.play().catch(() => {});
-      this._playLoop();
-    };
-    if (audio.readyState >= 1) {
-      startPlay();
-    } else {
-      audio.addEventListener("loadedmetadata", startPlay, { once: true });
-      audio.addEventListener("error", () => {
-        this.stop();
-        this.playing = false;
-        if (this.opts.onPlayState) this.opts.onPlayState(false);
-      }, { once: true });
-    }
-  }
-  /** 播放选区：固定从开始手柄位置起播 */
-  playSelection(url) {
-    if (!url || !this.hasData) return;
-    this.playRange(this.selStart, this.selEnd, url);
-    if (this.opts.onPlayState) this.opts.onPlayState(true);
-  }
-  stop() {
-    this.playing = false;
-    if (this.playRaf) cancelAnimationFrame(this.playRaf);
-    this.playRaf = null;
-    if (this.audio) {
-      try {
-        this.audio.pause();
-        this.audio.removeAttribute("src");
-      } catch (e) {}
-      this.audio = null;
-    }
-    this.render();
-    if (this.opts.onPlayState) this.opts.onPlayState(false);
-  }
-  _playLoop() {
-    if (!this.audio || !this.playing) return;
-    if (this.audio.currentTime >= this.audioEndTime) {
-      this.stop();
-      return;
-    }
-    this.playRaf = requestAnimationFrame(() => this._playLoop());
-  }
-
-  // ---------------------------------------------------------- 事件（Pointer Events）
-  _bind() {
-    const c = this.canvas;
-    const rect = () => c.getBoundingClientRect();
-
-    c.addEventListener("pointerdown", (e) => {
-      const r = rect();
-      const x = e.clientX - r.left;
-      const t = this._xToTime(x);
-      const w = c.clientWidth || c.width;
-      const edgePx = 14; // 手柄命中区（像素）
-      const sx = this._timeToX(this.selStart);
-      const ex = this._timeToX(this.selEnd);
-      const isSel = t >= this.selStart && t <= this.selEnd;
-
-      if (e.button === 1) {
-        e.preventDefault();
-        this.dragging = "view";
-        this.dragStartX = e.clientX;
-        this.dragStartView = this.viewStart;
-        this.pointerId = e.pointerId;
-        c.setPointerCapture(e.pointerId);
-        c.style.cursor = "grabbing";
-        return;
-      }
-      if (e.button !== 0) return;
-
-      // 手柄判定：纯像素距离优先（不依赖 isSel）
-      // 结束手柄在音频末尾时，鼠标落点常在右侧（t > selEnd → isSel=false），
-      // 旧逻辑会落入 view 分支导致结束手柄拖不动；改为像素距离直接命中。
-      // 先判 right 再判 left，避免小选区/重叠时误判为左手柄。
-      if (Math.abs(x - ex) <= edgePx) {
-        this.dragging = "right";
-        this.dragStartSel = { s: this.selStart, e: this.selEnd };
-      } else if (Math.abs(x - sx) <= edgePx) {
-        this.dragging = "left";
-        this.dragStartSel = { s: this.selStart, e: this.selEnd };
-      } else if (isSel) {
-        this.dragging = "sel";
-        this.dragStartSel = { s: this.selStart, e: this.selEnd };
-      } else {
-        this.dragging = "view";
-        this.dragStartX = e.clientX;
-        this.dragStartView = this.viewStart;
-      }
-      this.dragStartX = e.clientX;
-      this.pointerId = e.pointerId;
-      c.setPointerCapture(e.pointerId);
-      c.addEventListener("pointermove", this._bound.move);
-      c.addEventListener("pointerup", this._bound.up);
-      c.addEventListener("pointercancel", this._bound.cancel);
-    });
-
-    c.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      const r = rect();
-      const x = e.clientX - r.left;
-      const factor = e.deltaY < 0 ? 1.25 : 1 / 1.25;
-      this.zoomBy(factor, x);
-    }, { passive: false });
-
-    c.addEventListener("dblclick", (e) => {
-      const r = rect();
-      const x = e.clientX - r.left;
-      const t = this._xToTime(x);
-      if (t >= this.selStart && t <= this.selEnd) {
-        this.fitSelection();
-      } else {
-        this.fitAll();
-      }
-    });
-  }
-
-  _onMove(e) {
-    if (!this.dragging || (this.pointerId != null && e.pointerId !== this.pointerId)) return;
-    const c = this.canvas;
-    const r = c.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    const t = this._xToTime(x);
-    const w = c.clientWidth || c.width;
-    const dt = ((e.clientX - this.dragStartX) / Math.max(1, w)) * (this.viewEnd - this.viewStart);
-    const dur = this.duration || 1;
-    const minGap = 0.01;
-
-    if (this.dragging === "left") {
-      // 偏移量方式：手柄跟随指针精确移动，避免绝对 t 在边界时被钳制
-      const s = this.dragStartSel.s + dt;
-      this.selStart = Math.max(0, Math.min(s, this.selEnd - minGap));
-    } else if (this.dragging === "right") {
-      const en = this.dragStartSel.e + dt;
-      this.selEnd = Math.min(dur, Math.max(en, this.selStart + minGap));
-    } else if (this.dragging === "sel") {
-      let s = this.dragStartSel.s + dt;
-      let en = this.dragStartSel.e + dt;
-      if (s < 0) { en -= s; s = 0; }
-      if (en > dur) { s -= en - dur; en = dur; }
-      this.selStart = s;
-      this.selEnd = en;
-    } else if (this.dragging === "view") {
-      this.viewStart = Math.max(0, Math.min(this.dragStartView - dt, Math.max(0, dur - (this.viewEnd - this.viewStart))));
-      this.viewEnd = this.viewStart + (this.viewEnd - this.viewStart);
-    }
-    this.render();
-    if (this.opts.onSelection) this.opts.onSelection();
-  }
-
-  _onUp(e) {
-    if (this.pointerId != null && e && e.pointerId !== this.pointerId) return;
-    this.dragging = null;
-    this.pointerId = null;
-    const c = this.canvas;
-    c.style.cursor = "";
-    try {
-      c.removeEventListener("pointermove", this._bound.move);
-      c.removeEventListener("pointerup", this._bound.up);
-      c.removeEventListener("pointercancel", this._bound.cancel);
-    } catch (err) {}
-  }
-
-  // ---------------------------------------------------------- 渲染
-  render() {
-    const c = this.canvas;
-    const ctx = this.ctx;
-    const dpr = window.devicePixelRatio || 1;
-    const w = c.clientWidth || 320;
-    const h = c.clientHeight || 140;
-    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
-      c.width = Math.round(w * dpr);
-      c.height = Math.round(h * dpr);
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-
-    ctx.fillStyle = "#0e1420";
-    ctx.fillRect(0, 0, w, h);
-
-    // 版本标记
-    ctx.fillStyle = "rgba(120, 160, 220, 0.55)";
-    ctx.font = "9px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText("wwdm " + WWDM_VERSION, 4, h - 5);
-
-    if (!this.hasData) {
-      ctx.fillStyle = "#55607a";
-      ctx.font = "13px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("请在上方上传音频文件", w / 2, h / 2);
-      return;
-    }
-
-    const t0 = this.viewStart;
-    const t1 = this.viewEnd;
-    const span = Math.max(1e-6, t1 - t0);
-    const n = this.peaks.length;
-    const center = h / 2;
-    const sx = this._timeToX(this.selStart);
-    const ex = this._timeToX(this.selEnd);
-
-    // 选区背景
-    ctx.fillStyle = "rgba(70, 200, 120, 0.18)";
-    ctx.fillRect(sx, 0, Math.max(0, ex - sx), h);
-
-    // 波形
-    ctx.beginPath();
-    for (let px = 0; px <= w; px += 1) {
-      const t = t0 + (px / w) * span;
-      const idx = Math.floor((t / Math.max(1e-6, this.duration)) * n);
-      const peak = this.peaks[Math.max(0, Math.min(n - 1, idx))] || 0;
-      const amp = Math.pow(Math.min(1, peak * (this.opts.gain || 2.2)), 0.7);
-      const y0 = center - amp * (center - 6);
-      const y1 = center + amp * (center - 6);
-      ctx.moveTo(px, y0);
-      ctx.lineTo(px, y1);
-    }
-    ctx.strokeStyle = "#59d28b";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // 中线
-    ctx.strokeStyle = "rgba(255,255,255,0.10)";
-    ctx.beginPath();
-    ctx.moveTo(0, center);
-    ctx.lineTo(w, center);
-    ctx.stroke();
-
-    // 时间刻度
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.font = "10px monospace";
-    ctx.textAlign = "left";
-    let step = 5;
-    while (span / step > 240) step *= 2;
-    while (span / step < 60) step /= 2;
-    step = Math.max(1, Math.floor(step));
-    for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
-      const x = this._timeToX(t);
-      ctx.strokeStyle = "rgba(255,255,255,0.10)";
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
-      ctx.fillText(fmtHMS(t), x + 2, 12);
-    }
-
-    this._drawHandle(sx, "#ffd54a");
-    this._drawHandle(ex, "#ff6b6b");
-
-    if (ex - sx > 40) {
-      ctx.fillStyle = "rgba(255,255,255,0.75)";
-      ctx.font = "bold 11px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(fmtHMS(this.selEnd - this.selStart), (sx + ex) / 2, 14);
-    }
-  }
-
-  _drawHandle(x, color) {
-    const ctx = this.ctx;
-    const h = this.canvas.clientHeight || this.canvas.height;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, 8, 5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "#0e1420";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  destroy() {
-    this.stop();
-    try {
-      const c = this.canvas;
-      c.removeEventListener("pointermove", this._bound.move);
-      c.removeEventListener("pointerup", this._bound.up);
-      c.removeEventListener("pointercancel", this._bound.cancel);
-    } catch (err) {}
-  }
+  sel.selectedIndex = bestIdx;
 }
 
 // =====================================================================
@@ -534,27 +159,6 @@ async function decodeAudioBuffer(url) {
   } finally {
     await ctx.close().catch(() => {});
   }
-}
-
-function bufferToPeaks(buffer, numBuckets) {
-  const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) => buffer.getChannelData(i));
-  const total = buffer.length;
-  const peaks = new Float32Array(numBuckets);
-  if (total === 0) return peaks;
-  for (let b = 0; b < numBuckets; b++) {
-    const start = Math.floor((b / numBuckets) * total);
-    const end = Math.max(start + 1, Math.floor(((b + 1) / numBuckets) * total));
-    let max = 0;
-    const stride = Math.max(1, Math.floor((end - start) / 64));
-    for (let s = start; s < end; s += stride) {
-      for (const data of channels) {
-        const v = Math.abs(data[s] || 0);
-        if (v > max) max = v;
-      }
-    }
-    peaks[b] = max;
-  }
-  return peaks;
 }
 
 // =====================================================================
@@ -579,7 +183,7 @@ app.registerExtension({
           color: "#08b4ed",
           fontSize: "12px",
           textAlign: "center",
-          padding: "10px 8px",
+          padding: "8px 8px",
           cursor: "pointer",
           boxSizing: "border-box",
           transition: "border-color .12s, background .12s",
@@ -621,10 +225,10 @@ app.registerExtension({
           color: "#dde",
           border: "1px solid #2c3a4d",
           borderRadius: "4px",
-          padding: "5px 7px",
+          padding: "4px 6px",
           fontSize: "12px",
           boxSizing: "border-box",
-          marginTop: "6px",
+          marginTop: "5px",
           display: "none",
         },
       });
@@ -633,8 +237,6 @@ app.registerExtension({
         if (!name) return;
         this._wwdmLoadFile(name);
       });
-      const fileRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "0" } });
-      fileRow.append(this.wwdmFileSelect);
       this.wwdmFileName = $el("div", {
         style: {
           fontSize: "11px",
@@ -647,73 +249,48 @@ app.registerExtension({
         },
       });
 
-      // ---------- 波形画布 ----------
-      this.wwdmCanvas = $el("canvas", {
-        style: {
-          width: "100%",
-          height: "150px",
-          display: "block",
-          borderRadius: "4px",
-          background: "#0e1420",
-          cursor: "crosshair",
-          marginTop: "6px",
-          touchAction: "none",
-        },
-      });
-      this.wwdmWc = new WaveCanvas(this.wwdmCanvas, {
-        gain: 2.2,
-        onSelection: () => this._wwdmSyncWidgets(),
-        onPlayState: (playing) => {
-          this.wwdmBtnPlay.textContent = playing ? "⏹ 停止" : "▶ 播放";
-        },
-      });
-
-      // ---------- 时间输入行（hh:mm:ss） ----------
-      const mkInput = (label, ref, ph) => {
-        const inp = $el("input", {
-          type: "text",
-          placeholder: ph || "hh:mm:ss",
-          spellcheck: "false",
-          style: {
-            width: "100%",
-            background: "#0f1622",
-            color: "#dde",
-            border: "1px solid #2c3a4d",
-            borderRadius: "4px",
-            padding: "5px 7px",
-            fontSize: "12px",
-            boxSizing: "border-box",
-            fontFamily: "monospace",
-          },
-        });
+      // ---------- 时间下拉行（v8.6：开始/结束/时长，混合粒度） ----------
+      const selStyle = {
+        width: "100%",
+        background: "#0f1622",
+        color: "#dde",
+        border: "1px solid #2c3a4d",
+        borderRadius: "4px",
+        padding: "4px 6px",
+        fontSize: "12px",
+        boxSizing: "border-box",
+        fontFamily: "monospace",
+      };
+      const mkSel = (label, ref) => {
+        const sel = $el("select", { style: selStyle });
         const lab = $el("label", {
           style: {
             display: "flex",
             flexDirection: "column",
-            gap: "3px",
+            gap: "2px",
             fontSize: "11px",
             color: "#8fa0b8",
             flex: 1,
           },
         });
-        lab.append(document.createTextNode(label), inp);
-        this[ref] = inp;
+        lab.append(document.createTextNode(label), sel);
+        this[ref] = sel;
         return lab;
       };
-      const inputRow = $el("div", { style: { display: "flex", gap: "8px", marginTop: "6px" } });
-      inputRow.append(
-        mkInput("开始时间", "wwdmInpStart", "hh:mm:ss"),
-        mkInput("结束时间", "wwdmInpEnd", "hh:mm:ss"),
-        mkInput("选取时长(秒)", "wwdmInpDur", "10.0")
+      const timeRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } });
+      timeRow.append(
+        mkSel("开始时间", "wwdmSelStart"),
+        mkSel("结束时间", "wwdmSelEnd"),
+        mkSel("选取时长", "wwdmSelDur")
       );
 
-      // ---------- 按钮行（播放 + 同步） ----------
+      // ---------- 按钮行（播放 + 同步 + 预加载） ----------
       const btnStyle = (bg) => ({
         background: bg,
         color: "#fff",
         border: "none",
         borderRadius: "5px",
-        padding: "7px 16px",
+        padding: "6px 12px",
         fontSize: "12px",
         cursor: "pointer",
         fontWeight: 600,
@@ -723,40 +300,37 @@ app.registerExtension({
       this.wwdmBtnSync = $el("button", { textContent: "🔄 同步", style: btnStyle("#3d5a80") });
       this.wwdmBtnPreload = $el("button", { textContent: "⏬ 预加载", style: btnStyle("#6a4fa3") });
       const hint = $el("div", {
-        style: { fontSize: "10px", color: "#5c6a82", flex: "1.4", lineHeight: "16px", textAlign: "right" },
-        textContent: "滚轮缩放 · 拖动平移 · 双击适配",
+        style: { fontSize: "10px", color: "#5c6a82", flex: "1.2", lineHeight: "16px", textAlign: "right" },
+        textContent: "版本 " + WWDM_VERSION,
       });
       const btnRow = $el("div", { style: { display: "flex", gap: "6px", marginTop: "6px", alignItems: "center" } });
       btnRow.append(this.wwdmBtnPlay, this.wwdmBtnSync, this.wwdmBtnPreload, hint);
 
       const wrap = $el("div", { style: { width: "100%", padding: "2px 0" } });
-      wrap.append(uploadZone, fileRow, this.wwdmFileName, this.wwdmCanvas, inputRow, btnRow);
+      wrap.append(uploadZone, this.wwdmFileSelect, this.wwdmFileName, timeRow, btnRow);
       this.wwdmUiEl = wrap;
 
       if (this.addDOMWidget) {
         this.wwdmWidget = this.addDOMWidget("wwdm_ui", "wwdm_ui", wrap, { serialize: false });
+        // v8.6：无波形画布，内容更紧凑。固定高度（上传区34+下拉30+文件名16+时间行52+按钮行30+边距≈20 ≈ 182）
         this.wwdmWidget.computeSize = function (width) {
-          return [width || 320, 310];
+          return [width || 320, 185];
         };
       } else {
         const container = this.el || this.nodeEl || this.constructor?.nodeEl;
         if (container) container.appendChild(wrap);
       }
 
-      // 节点高度覆盖（确保上传区/画布/输入行/播放/同步/预加载按钮全部可见；
-      // 原生 start/end/duration widget 已隐藏，高度相应缩减）
+      // 节点高度覆盖（v8.6：无画布，内容紧凑）
       const origComputeSize = this.computeSize?.bind(this);
       this.computeSize = function (w) {
-        const base = origComputeSize ? origComputeSize(w) : [360, 400];
-        const needed = 380; // 上传区(38)+下拉(30)+文件名(20)+画布(150)+输入行(52)+按钮行(38)+边距(~52)
+        const base = origComputeSize ? origComputeSize(w) : [360, 300];
+        const needed = 240; // 上传区(34)+下拉(30)+文件名(16)+时间行(52)+按钮行(30)+边距(~78)
         return [base[0], Math.max(base[1], needed)];
       };
 
       // ---------- 隐藏原生 start_time/end_time/duration + audio_file 参数（v8） ----------
-      // 需求：去掉节点上半部分的三个参数，只保留波形下方的输入框。
-      // 用 computeSize 折叠 widget，使其在面板上不渲染；但 widget 仍留在
-      // this.widgets 中，值会被序列化并随执行传给后端 crop()，保证功能不变。
-      // audio_file 是上传路径的存储载体，同样隐藏（上传/选择走按钮+下拉框）。
+      // widget 仍留在 this.widgets 中，值会被序列化并随执行传给后端 crop()，保证功能不变。
       for (const nm of ["start_time", "end_time", "duration", "audio_file"]) {
         const w = this.widgets?.find((x) => x.name === nm);
         if (w) {
@@ -765,31 +339,38 @@ app.registerExtension({
         }
       }
 
-      // ---------- 输入框事件（hh:mm:ss / 秒） ----------
+      // ---------- 状态 ----------
       this._wwdmGuard = false;
-      this._wwdmReadInputs = () => {
-        const sv = parseTime(this.wwdmInpStart.value);
-        const ev = parseTime(this.wwdmInpEnd.value);
-        const dv = parseTime(this.wwdmInpDur.value);
-        return { sv, ev, dv };
+      // v8.6：时间选区状态（不再有波形画布）
+      this._wwdmSel = { s: 0, e: 0 };
+      this._wwdmDuration = 0;
+      this._wwdmAudioUrl = "";
+      this._wwdmHasAudio = false;
+      // ---------- 时间下拉事件（v8.6） ----------
+      const applyFromDropdowns = () => {
+        if (!this._wwdmHasAudio) return;
+        const dur = this._wwdmDuration || 1;
+        const sv = this.wwdmSelStart.value ? Number(this.wwdmSelStart.value) : 0;
+        const ev = this.wwdmSelEnd.value ? Number(this.wwdmSelEnd.value) : dur;
+        const dv = this.wwdmSelDur.value ? Number(this.wwdmSelDur.value) : 0;
+        let s = Math.max(0, Math.min(sv, dur));
+        let e;
+        if (dv != null && dv > 0) {
+          e = Math.min(dur, s + dv); // 时长优先
+        } else {
+          e = Math.min(dur, Math.max(ev, s + 0.01));
+        }
+        if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
+        this._setSel(s, e);
       };
-      // 手动输入修改：change/Enter 时应用（同步按钮为强制统一入口）
-      this.wwdmInpStart.addEventListener("change", () => this._wwdmApplyInputs("start"));
-      this.wwdmInpEnd.addEventListener("change", () => this._wwdmApplyInputs("end"));
-      this.wwdmInpDur.addEventListener("change", () => this._wwdmApplyInputs("dur"));
-      for (const inp of [this.wwdmInpStart, this.wwdmInpEnd, this.wwdmInpDur]) {
-        inp.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            const which = inp === this.wwdmInpStart ? "start" : inp === this.wwdmInpEnd ? "end" : "dur";
-            this._wwdmApplyInputs(which);
-          }
-        });
-      }
+      this.wwdmSelStart.addEventListener("change", applyFromDropdowns);
+      this.wwdmSelEnd.addEventListener("change", applyFromDropdowns);
+      this.wwdmSelDur.addEventListener("change", applyFromDropdowns);
 
-      // ---------- 同步按钮（v8.3：只同步时间选择与手柄位置，不加载波形） ----------
+      // ---------- 同步按钮（v8.3：只同步时间选择，不加载波形） ----------
       this.wwdmBtnSync.addEventListener("click", () => this._wwdmSyncAll());
 
-      // ---------- 预加载按钮（v8.3：从输入端获取当前音频并刷新波形） ----------
+      // ---------- 预加载按钮（v8.3：从输入端获取当前音频并刷新） ----------
       this.wwdmBtnPreload.addEventListener("click", () => this._wwdmPreload());
 
       // ---------- 播放按钮 ----------
@@ -799,14 +380,14 @@ app.registerExtension({
           alert("请先上传或选择音频文件");
           return;
         }
-        if (!this.wwdmWc.hasData) {
-          alert("波形尚未加载，请稍候或重新选择");
+        if (!this._wwdmHasAudio) {
+          alert("音频尚未加载，请先点「⏬ 预加载」或上传");
           return;
         }
-        if (this.wwdmWc.playing) {
-          this.wwdmWc.stop();
+        if (this._wwdmPlaying) {
+          this._wwdmStopPlay();
         } else {
-          this.wwdmWc.playSelection(url);
+          this._wwdmPlaySelection(url);
         }
       });
 
@@ -831,7 +412,7 @@ app.registerExtension({
         }
       };
 
-      /** 加载已上传/已选择的音频文件（写入 widget + 解码画波形） */
+      /** 加载已上传/已选择的音频文件（写入 widget + 解码获取时长 + 填充时间下拉） */
       this._wwdmLoadFile = async (name) => {
         if (!name) return;
         this._wwdmCurrentName = name;
@@ -848,18 +429,14 @@ app.registerExtension({
         }
         if (sel) sel.value = name;
         try {
-          this.wwdmCanvas.style.opacity = "0.45";
           const buffer = await decodeAudioBuffer(makeFileUrl(name));
-          const peaks = bufferToPeaks(buffer, 1200);
           const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
-          this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
-          this.wwdmWc.setSelection(0, duration);
-          this.wwdmCanvas.style.opacity = "1";
-          this._wwdmSyncWidgets();
+          this._wwdmDuration = duration;
+          this._wwdmHasAudio = true;
+          this._setSel(0, duration); // 全选并填充下拉
         } catch (err) {
-          console.error("[wwdm] 波形解码失败", err);
-          this.wwdmCanvas.style.opacity = "1";
-          this.wwdmFileName.textContent = "❌ 波形解码失败: " + String(err.message || err);
+          console.error("[wwdm] 音频解码失败", err);
+          this.wwdmFileName.textContent = "❌ 音频解码失败: " + String(err.message || err);
         }
       };
 
@@ -907,27 +484,18 @@ app.registerExtension({
       return r;
     };
 
-    // ---------- 应用输入框修改（单字段同步） ----------
-    nodeType.prototype._wwdmApplyInputs = function (which) {
-      if (!this.wwdmWc?.hasData) return;
-      const { sv, ev, dv } = this._wwdmReadInputs();
-      const dur = this.wwdmWc.duration;
-      const sel = this.wwdmWc.selection;
-      let s = sel.start, e = sel.end;
-
-      if (which === "start") {
-        if (sv == null) { this._wwdmSyncWidgets(); return; }
-        s = Math.min(Math.max(0, sv), dur);
-        if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
-      } else if (which === "end") {
-        if (ev == null) { this._wwdmSyncWidgets(); return; }
-        e = Math.min(Math.max(s + 0.01, ev), dur);
-      } else if (which === "dur") {
-        if (dv != null && dv > 0) {
-          e = Math.min(dur, s + dv);
-        }
-      }
-      this.wwdmWc.setSelection(s, e);
+    // ---------- 设置选区（v8.6：核心状态入口） ----------
+    // 写 _wwdmSel、刷新三个时间下拉、写隐藏 widget（start_time/end_time/duration）
+    nodeType.prototype._setSel = function (s, e) {
+      const dur = this._wwdmDuration || 0;
+      if (dur <= 0) return;
+      s = Math.max(0, Math.min(s, dur));
+      e = Math.max(s, Math.min(e, dur));
+      this._wwdmSel = { s, e };
+      // 刷新下拉（保持当前选择，若档位不同则就近对齐）
+      fillTimeSelect(this.wwdmSelStart, dur, s);
+      fillTimeSelect(this.wwdmSelEnd, dur, e);
+      fillTimeSelect(this.wwdmSelDur, dur, e - s);
       this._wwdmSyncWidgets();
     };
 
@@ -969,31 +537,30 @@ app.registerExtension({
       return info ? info.name : null;
     };
 
-    // ---------- 同步（v8.3：只同步时间选择与手柄位置，不加载波形） ----------
+    // ---------- 同步（v8.3：只同步时间选择，不加载音频） ----------
+    // v8.6：从三个下拉读取开始/结束/时长，重算选区（时长优先）
     nodeType.prototype._wwdmSyncAll = function () {
-      if (!this.wwdmWc) return;
-      if (!this.wwdmWc.hasData) {
-        alert("波形尚未加载：请先点击「⏬ 预加载」从输入音频加载波形");
+      if (!this._wwdmHasAudio) {
+        alert("音频尚未加载：请先点「⏬ 预加载」或上传音频");
         return;
       }
-      // 按输入行时间参数同步手柄：开始时间 / 选取时长(优先) / 结束时间
-      const { sv, ev, dv } = this._wwdmReadInputs();
-      const dur = this.wwdmWc.duration;
-      let s = 0, e = dur;
-      if (sv != null && sv >= 0) s = Math.min(sv, dur);
+      const dur = this._wwdmDuration || 1;
+      const sv = this.wwdmSelStart.value ? Number(this.wwdmSelStart.value) : 0;
+      const ev = this.wwdmSelEnd.value ? Number(this.wwdmSelEnd.value) : dur;
+      const dv = this.wwdmSelDur.value ? Number(this.wwdmSelDur.value) : 0;
+      let s = Math.max(0, Math.min(sv, dur));
+      let e;
       if (dv != null && dv > 0) {
-        e = Math.min(dur, s + dv);
-      } else if (ev != null && ev > 0) {
+        e = Math.min(dur, s + dv); // 时长优先
+      } else {
         e = Math.min(dur, Math.max(ev, s + 0.01));
       }
       if (e <= s + 0.01) e = Math.min(dur, s + 0.01);
-      this.wwdmWc.setSelection(s, e);
-      this._wwdmSyncWidgets();
+      this._setSel(s, e);
     };
 
-    // ---------- 预加载（v8.4：从输入端获取当前音频并刷新波形，每次强制重新解码） ----------
+    // ---------- 预加载（v8.4：从输入端获取当前音频，每次强制重新解码） ----------
     nodeType.prototype._wwdmPreload = async function () {
-      if (!this.wwdmWc) return;
       const info = this._wwdmResolveSourceInfo();
       const name = info ? info.name : null;
       if (!name) {
@@ -1002,12 +569,8 @@ app.registerExtension({
       }
       const url = makeFileUrl(name);
       try {
-        this.wwdmCanvas.style.opacity = "0.45";
         const buffer = await decodeAudioBuffer(url);
-        const peaks = bufferToPeaks(buffer, 1200);
         const duration = buffer.duration || (buffer.length / (buffer.sampleRate || 44100));
-        this.wwdmWc.setData(peaks, buffer.sampleRate || 44100, duration);
-        this.wwdmCanvas.style.opacity = "1";
         // 更新来源展示（强制刷新：即使同名也刷新 UI，解决更换输入音频后点击无效）
         this._wwdmCurrentName = name;
         // 仅节点内上传才写入 audio_file widget；上游 LoadAudio 来源不写 widget，
@@ -1020,6 +583,8 @@ app.registerExtension({
         }
         this.wwdmFileName.textContent = "已加载: " + name;
         this.wwdmAudioUrl = url;
+        this._wwdmDuration = duration;
+        this._wwdmHasAudio = true;
         const sel = this.wwdmFileSelect;
         if (sel && ![...sel.options].some((o) => o.value === name)) {
           const opt = document.createElement("option");
@@ -1028,98 +593,130 @@ app.registerExtension({
           sel.appendChild(opt);
         }
         if (sel) sel.value = name;
-        // 波形刷新后：选区重置为全选，并同步到输入行
-        this.wwdmWc.setSelection(0, duration);
-        this._wwdmSyncWidgets();
+        // 新音频：选区重置为全选，并填充时间下拉
+        this._setSel(0, duration);
       } catch (err) {
-        console.error("[wwdm] 预加载波形失败", err);
-        this.wwdmCanvas.style.opacity = "1";
-        this.wwdmFileName.textContent = "❌ 波形加载失败: " + String(err.message || err);
-        alert("波形加载失败: " + String(err.message || err));
+        console.error("[wwdm] 预加载失败", err);
+        this.wwdmFileName.textContent = "❌ 音频加载失败: " + String(err.message || err);
+        alert("音频加载失败: " + String(err.message || err));
       }
     };
 
-    // ---------- 选区 → 节点参数 + 输入框 同步 ----------
+    // ---------- 选区 → 隐藏 widget（start_time/end_time/duration）同步 ----------
     nodeType.prototype._wwdmSyncWidgets = function () {
       if (this._wwdmGuard) return;
       this._wwdmGuard = true;
       try {
-        const { start, end } = this.wwdmWc.selection;
-        const dur = end - start;
+        const { s, e } = this._wwdmSel || { s: 0, e: 0 };
+        const dur = Math.max(0, e - s);
         const w = (name) => this.widgets?.find((x) => x.name === name);
         const ws = w("start_time"), we = w("end_time"), wd = w("duration");
-        if (ws) ws.value = fmtHMS(start);
-        if (we) we.value = fmtHMS(end);
+        if (ws) ws.value = fmtHMS(s);
+        if (we) we.value = fmtHMS(e);
         if (wd) wd.value = fmtSec1(dur);
-        if (this.wwdmInpStart) this.wwdmInpStart.value = fmtHMS(start);
-        if (this.wwdmInpEnd) this.wwdmInpEnd.value = fmtHMS(end);
-        if (this.wwdmInpDur) this.wwdmInpDur.value = fmtSec1(dur);
       } finally {
         this._wwdmGuard = false;
       }
     };
 
-    // ---------- 节点参数变化 → 波形 ----------
+    // ---------- 节点参数变化 → 下拉（反向联动，一般不会触发因为 widget 已隐藏） ----------
     const onWidgetChanged = nodeType.prototype.onWidgetChanged;
     nodeType.prototype.onWidgetChanged = function (widget, value) {
       const r = onWidgetChanged?.apply(this, arguments);
-      if (this._wwdmGuard || !this.wwdmWc?.hasData) return r;
+      if (this._wwdmGuard || !this._wwdmHasAudio) return r;
       if (widget?.name === "start_time") {
         const v = parseTime(value);
         if (v != null) {
-          const e = Math.max(v + 0.01, this.wwdmWc.selEnd);
-          this.wwdmWc.setSelection(v, e);
+          const e = Math.max(v + 0.01, this._wwdmSel.e);
+          this._setSel(v, e);
         }
       } else if (widget?.name === "end_time") {
         const v = parseTime(value);
         if (v != null) {
-          const s = Math.min(v - 0.01, this.wwdmWc.selStart);
-          this.wwdmWc.setSelection(s, v);
+          const s = Math.min(v - 0.01, this._wwdmSel.s);
+          this._setSel(s, v);
         }
       } else if (widget?.name === "duration") {
         const v = parseTime(value);
-        if (v != null) this.wwdmWc.setDuration(v);
+        if (v != null) this._setSel(this._wwdmSel.s, this._wwdmSel.s + v);
       }
       return r;
     };
 
-    // ---------- 执行结果 ----------
+    // ---------- 执行结果（保留：读取后端返回的时长/URL，刷新时间下拉） ----------
     const onExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (message) {
       const r = onExecuted?.apply(this, arguments);
-      // 后端 executed 消息的 ui 字段值都是数组（get_output_from_returns 合并逻辑），
-      // 需取 [0]；也兼容直接对象
       const pick = (v) => (Array.isArray(v) ? v[0] : v);
-      const wf = pick(message?.wwdm_waveform);
       const audioUrl = pick(message?.wwdm_audio_url);
-      if (wf && Array.isArray(wf.peaks) && wf.peaks.length) {
-        // 保留用户已设置的时间参数：执行后手柄反映 start/end/duration 值
-        const w = (name) => this.widgets?.find((x) => x.name === name);
-        const sv = parseTime(w("start_time")?.value);
-        const ev = parseTime(w("end_time")?.value);
-        const dv = parseTime(w("duration")?.value);
-        this.wwdmWc.setData(wf.peaks, wf.sample_rate, wf.duration);
-        let s = 0, e = this.wwdmWc.duration;
-        if (sv != null && sv >= 0) s = Math.min(sv, e);
-        if (dv != null && dv > 0) e = Math.min(e, s + dv);
-        else if (ev != null && ev > 0) e = Math.min(e, Math.max(ev, s + 0.01));
-        this.wwdmWc.setSelection(s, e);
-        if (audioUrl) this.wwdmAudioUrl = audioUrl;
-        this._wwdmSyncWidgets();
+      const cropUrl = pick(message?.wwdm_crop_url);
+      if (audioUrl) this.wwdmAudioUrl = audioUrl;
+      if (cropUrl) this._wwdmCropUrl = cropUrl;
+      // 保留用户已设置的时间参数：执行后下拉反映 start/end/duration 值
+      const w = (name) => this.widgets?.find((x) => x.name === name);
+      const sv = parseTime(w("start_time")?.value);
+      const ev = parseTime(w("end_time")?.value);
+      const dv = parseTime(w("duration")?.value);
+      if (sv != null || ev != null || dv != null) {
+        const dur = this._wwdmDuration || 1;
+        let s = this._wwdmSel?.s ?? 0;
+        let e = this._wwdmSel?.e ?? dur;
+        if (sv != null && sv >= 0) s = Math.min(sv, dur);
+        if (dv != null && dv > 0) e = Math.min(dur, s + dv);
+        else if (ev != null && ev > 0) e = Math.min(dur, Math.max(ev, s + 0.01));
+        this._setSel(s, e);
       }
       return r;
     };
 
-    // ---------- 序列化保留波形 ----------
+    // ---------- 序列化保留（v8.6：无波形，无需恢复；保留钩子） ----------
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (info) {
-      const r = onConfigure?.apply(this, arguments);
-      const pick = (v) => (Array.isArray(v) ? v[0] : v);
-      const wf = pick(info?.wwdm_waveform);
-      if (wf && Array.isArray(wf.peaks) && wf.peaks.length) {
-        this.wwdmWc.setData(wf.peaks, wf.sample_rate, wf.duration);
+      return onConfigure?.apply(this, arguments);
+    };
+
+    // ---------- 播放（v8.6：用 <audio> 播放选区，无波形） ----------
+    nodeType.prototype._wwdmPlaySelection = function (url) {
+      if (!url || !this._wwdmHasAudio) return;
+      this._wwdmStopPlay();
+      const audio = new Audio(url);
+      this._wwdmAudioEl = audio;
+      this._wwdmPlaying = true;
+      this.wwdmBtnPlay.textContent = "⏹ 停止";
+      const { s, e } = this._wwdmSel || { s: 0, e: 0 };
+      const startPlay = () => {
+        try {
+          audio.currentTime = Math.max(0, Math.min(s, this._wwdmDuration || 0));
+        } catch (err) {}
+        audio.play().catch(() => {});
+      };
+      if (audio.readyState >= 1) startPlay();
+      else audio.addEventListener("loadedmetadata", startPlay, { once: true });
+      audio.addEventListener("ended", () => this._wwdmStopPlay(), { once: true });
+      audio.addEventListener("error", () => this._wwdmStopPlay(), { once: true });
+      // 播放到结束时间自动停止
+      const checkEnd = () => {
+        if (!this._wwdmPlaying || !this._wwdmAudioEl) return;
+        if (this._wwdmAudioEl.currentTime >= e) {
+          this._wwdmStopPlay();
+          return;
+        }
+        this._wwdmPlayRaf = requestAnimationFrame(checkEnd);
+      };
+      this._wwdmPlayRaf = requestAnimationFrame(checkEnd);
+    };
+    nodeType.prototype._wwdmStopPlay = function () {
+      this._wwdmPlaying = false;
+      if (this._wwdmPlayRaf) cancelAnimationFrame(this._wwdmPlayRaf);
+      this._wwdmPlayRaf = null;
+      if (this._wwdmAudioEl) {
+        try {
+          this._wwdmAudioEl.pause();
+          this._wwdmAudioEl.removeAttribute("src");
+        } catch (err) {}
+        this._wwdmAudioEl = null;
       }
-      return r;
+      if (this.wwdmBtnPlay) this.wwdmBtnPlay.textContent = "▶ 播放";
     };
   },
 });
