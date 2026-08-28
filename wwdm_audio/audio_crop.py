@@ -29,6 +29,7 @@ import time
 
 import numpy as np
 import torch
+from collections.abc import Mapping
 import folder_paths
 from PIL import Image
 
@@ -41,6 +42,46 @@ except Exception:
 # =====================================================================
 # 时间解析（mm:ss 格式）
 # =====================================================================
+def _resolve_audio(audio):
+    """统一解析 AUDIO 输入，兼容多种结构，返回 (waveform[1,C,L], sample_rate)。
+
+    支持：
+      - dict / Mapping（含 VHS LazyAudioMap 等懒加载类）: {"waveform": tensor, "sample_rate": int}
+      - 对象属性: .waveform / .sample_rate（部分视频/音频节点）
+      - tensor 本体: [B,C,L] 或 [C,L]（部分视频节点提取的音频）
+    LazyAudioMap 在首次 __getitem__ 时才真正解码（ffmpeg），返回 dict 结构，
+    因此用 isinstance(audio, Mapping) 即可覆盖，无需引入 VHS 依赖。
+    """
+    waveform = None
+    sample_rate = None
+    if isinstance(audio, Mapping):
+        # dict / LazyAudioMap 等 Mapping 子类
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate")
+    elif hasattr(audio, "waveform") and hasattr(audio, "sample_rate"):
+        waveform = audio.waveform
+        sample_rate = audio.sample_rate
+    elif isinstance(audio, torch.Tensor):
+        waveform = audio
+    else:
+        raise ValueError(
+            "WWDMAudioCrop: 无法识别的音频输入类型 %s（%s），请使用 LoadAudio / 视频节点输出或上传文件"
+            % (type(audio).__name__, type(audio).__module__)
+        )
+    if waveform is None:
+        raise ValueError("WWDMAudioCrop: 音频输入缺少 waveform 数据")
+    if sample_rate is None:
+        sample_rate = 44100
+    if not isinstance(waveform, torch.Tensor):
+        waveform = torch.from_numpy(np.asarray(waveform, dtype=np.float32))
+    if waveform.ndim == 2:
+        waveform = waveform.unsqueeze(0)  # [C,L] -> [1,C,L]
+    if waveform.ndim != 3:
+        raise ValueError("WWDMAudioCrop: 音频 waveform 维度异常 %s（期望 [1,C,L]）" % (waveform.shape,))
+    return waveform, int(sample_rate)
+
+
+
 def _parse_time(v, default=0.0):
     """解析 hh:mm:ss.s / mm:ss.s / 纯秒 → float 秒；无效返回 default"""
     if v is None:
@@ -249,10 +290,10 @@ class WWDMAudioCrop:
         try:
             key = str(audio_file or "")
             if audio is not None:
-                if isinstance(audio, dict):
+                if isinstance(audio, Mapping):
                     wf = audio.get("waveform")
                 else:
-                    wf = audio.waveform
+                    wf = getattr(audio, "waveform", None)
                 if wf is not None:
                     key += f"#{float(wf.shape[-1])}#{int(wf.dtype == torch.float16)}"
             return key
@@ -268,29 +309,8 @@ class WWDMAudioCrop:
             wav2d, sample_rate = load_audio_file(path)
             waveform = wav2d.unsqueeze(0)  # [C,L] -> [1,C,L]
         elif audio is not None:
-            # 兼容多种音频输入结构：
-            #   {"waveform": tensor, "sample_rate": int}   LoadAudio / 音频节点
-            #   对象属性（.waveform / .sample_rate）          部分视频/音频节点
-            #   tensor 本体（[B,C,L] 或 [C,L]）               部分视频节点提取的音频
-            if isinstance(audio, dict):
-                waveform = audio.get("waveform")
-                sample_rate = audio.get("sample_rate")
-            elif hasattr(audio, "waveform") and hasattr(audio, "sample_rate"):
-                waveform = audio.waveform
-                sample_rate = audio.sample_rate
-            elif isinstance(audio, torch.Tensor):
-                waveform = audio
-            else:
-                raise ValueError(
-                    "WWDMAudioCrop: 无法识别的音频输入类型 %s，请使用 LoadAudio 或上传文件"
-                    % type(audio).__name__
-                )
-            if waveform is None:
-                raise ValueError("WWDMAudioCrop: 音频输入缺少 waveform 数据")
-            if sample_rate is None:
-                sample_rate = 44100
-            if waveform.ndim == 2:
-                waveform = waveform.unsqueeze(0)  # [C,L] -> [1,C,L]
+            # 统一解析：dict / VHS LazyAudioMap 等 Mapping / 对象属性 / tensor
+            waveform, sample_rate = _resolve_audio(audio)
         else:
             raise ValueError("WWDMAudioCrop: 请在节点内上传音频文件，或连接 AUDIO 输入")
 
